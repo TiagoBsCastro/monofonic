@@ -19,6 +19,7 @@
 
 #include <string>
 #include <cstring>
+#include <cstdint>
 #include <map>
 
 #include <particle_container.hh>
@@ -46,10 +47,12 @@ protected:
 	std::string interface_name_;
 public:
 	//! constructor
-	output_plugin(config_file &cf, std::unique_ptr<cosmology::calculator>& pcc, std::string interface_name )
+	output_plugin(config_file &cf, std::unique_ptr<cosmology::calculator>& pcc, std::string interface_name,
+				  bool requires_filename = true)
 		: cf_(cf), pcc_(pcc), interface_name_(interface_name)
 	{
-		fname_ = cf_.get_value<std::string>("output", "filename");
+		if (requires_filename)
+			fname_ = cf_.get_value<std::string>("output", "filename");
 	}
 
 	//! virtual destructor
@@ -63,6 +66,15 @@ public:
 
 	//! routine to only set particle attributes for a species
 	virtual void set_particle_attributes(uint64_t numpart_local, uint64_t numpart_total, const cosmo_species &s, double Omega_species) {};
+
+	//! routine to transfer an externally generated strided particle batch
+	virtual void write_strided_particle_data(const void *positions, std::size_t position_stride,
+										const void *velocities, std::size_t velocity_stride,
+										const void *phase_space_densities,
+										std::size_t phase_space_density_stride,
+										std::uint64_t numpart_local, std::uint64_t first_id,
+										double uniform_mass, double neutrino_mass_ev,
+										double neutrino_temperature_ev, const cosmo_species &s) {};
 
 	//! routine to write gridded fluid component data for a species
 	virtual void write_grid_data(const Grid_FFT<real_t> &g, const cosmo_species &s, const fluid_component &c ) {};
@@ -131,4 +143,3 @@ struct output_plugin_creator_concrete : public output_plugin_creator
 
 //! failsafe version to select the output plug-in
 std::unique_ptr<output_plugin> select_output_plugin(config_file &cf, std::unique_ptr<cosmology::calculator>& pcc);
-

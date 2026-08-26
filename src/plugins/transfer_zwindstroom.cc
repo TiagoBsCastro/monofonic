@@ -31,6 +31,7 @@
 #include <general.hh>
 #include <config_file.hh>
 #include <transfer_function_plugin.hh>
+#include <embedded.hh>
 #include <ic_generator.hh>
 
 #include <math/interpolate.hh>
@@ -609,6 +610,10 @@ public:
     music::ilog << "Asymptotic fm_start = " << fm_asymptotic_ << std::endl;
     music::ilog << "Asymptotic fcb_start = " << fcb_asymptotic_ << std::endl;
     music::ilog << "Asymptotic vfac = " << vfac_asymptotic_ << " km/s/Mpc at a_start" << std::endl;
+
+    // Retain the internally calculated background for an embedding simulation
+    // code.  This avoids accepting a separately supplied H(z) or w(z) table.
+    monofonic::set_background_table(tab.avec, tab.Hvec, tab.size, H_units);
 
     // export a table with Hubble rates for cosmological sims that require this
     std::string fname_hubble = "input_hubble.txt";

@@ -29,6 +29,80 @@
 
 #ifdef USE_FASTDF
 #include <fastdf_cpp.h>
+#include <hdf5.h>
+#endif
+
+#ifdef USE_FASTDF
+namespace
+{
+int fastdf_memory_particle_sink(void *context, const void *positions, size_t position_stride,
+                                const void *velocities, size_t velocity_stride,
+                                const void *phase_space_densities, size_t phase_space_density_stride,
+                                unsigned long long count, unsigned long long first_id, double uniform_mass,
+                                double neutrino_mass_ev, double neutrino_temperature_ev)
+{
+    try
+    {
+        static_cast<output_plugin *>(context)->write_strided_particle_data(
+            positions, position_stride, velocities, velocity_stride, phase_space_densities,
+            phase_space_density_stride, count, first_id, uniform_mass, neutrino_mass_ev,
+            neutrino_temperature_ev, cosmo_species::neutrino);
+        return 0;
+    }
+    catch (const std::exception &error)
+    {
+        music::elog << "FastDF in-memory particle transfer failed: " << error.what() << std::endl;
+        return 1;
+    }
+    catch (...)
+    {
+        music::elog << "FastDF in-memory particle transfer failed with an unknown exception." << std::endl;
+        return 1;
+    }
+}
+
+std::string distributed_hdf5_filename(const std::string &base_filename)
+{
+    if (CONFIG::MPI_task_size <= 1)
+        return base_filename;
+
+    const std::string::size_type dot = base_filename.find_last_of('.');
+    if (dot == std::string::npos)
+        return base_filename + "." + std::to_string(CONFIG::MPI_task_rank);
+    return base_filename.substr(0, dot) + "." + std::to_string(CONFIG::MPI_task_rank) + base_filename.substr(dot);
+}
+
+void merge_fastdf_particle_group(const std::string &temporary_base, const std::string &target_base,
+                                 const std::string &group_name)
+{
+    const std::string temporary = distributed_hdf5_filename(temporary_base);
+    const std::string target = distributed_hdf5_filename(target_base);
+
+    hid_t source_file = H5Fopen(temporary.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (source_file < 0)
+        throw std::runtime_error("could not open temporary FastDF output '" + temporary + "'");
+
+    hid_t target_file = H5Fopen(target.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
+    if (target_file < 0)
+    {
+        H5Fclose(source_file);
+        throw std::runtime_error("could not open monofonIC output '" + target + "'");
+    }
+
+    const std::string absolute_group = "/" + group_name;
+    if (H5Lexists(target_file, absolute_group.c_str(), H5P_DEFAULT) > 0)
+        H5Ldelete(target_file, absolute_group.c_str(), H5P_DEFAULT);
+
+    const herr_t copy_status = H5Ocopy(source_file, absolute_group.c_str(), target_file, absolute_group.c_str(),
+                                       H5P_DEFAULT, H5P_DEFAULT);
+    H5Fclose(target_file);
+    H5Fclose(source_file);
+    unlink(temporary.c_str());
+
+    if (copy_status < 0)
+        throw std::runtime_error("could not merge FastDF particle group into '" + target + "'");
+}
+}
 #endif
 
 /**
@@ -1119,9 +1193,6 @@ int run( config_file& the_config )
             pars.PrimordialRunning = the_cosmo_calc->cosmo_param_["alpha_s"];
             pars.PrimordialRunningSecond = the_cosmo_calc->cosmo_param_["beta_s"];
 
-            std::string out_fname;
-            out_fname = the_config.get_value<std::string>("output", "filename");
-
             std::string nupart_density_tfunc = "d_ncdm[0]";
             std::string gauge = "N-body";
             std::string class_parameter_file = "input_class_parameters.ini";
@@ -1131,10 +1202,14 @@ int run( config_file& the_config )
             std::string velocity_type;
             int include_h_factor;
             int distributed_files;
-            if (out_plug == "gadget_hdf5" || out_plug == "AREPO") {
+            const bool opengadget_memory = out_plug == "opengadget_memory";
+            const std::string out_fname = opengadget_memory
+                                              ? std::string()
+                                              : the_config.get_value<std::string>("output", "filename");
+            if (out_plug == "gadget_hdf5" || out_plug == "AREPO" || opengadget_memory) {
                 velocity_type = "Gadget";
                 include_h_factor = 1;
-                distributed_files = 1;
+                distributed_files = opengadget_memory ? 0 : 1;
             } else if (out_plug == "SWIFT") {
                 velocity_type = "peculiar";
                 include_h_factor = 0;
@@ -1155,7 +1230,18 @@ int run( config_file& the_config )
             // Set string parameters
             strcpy(pars.OutputDirectory, ".");
             strcpy(pars.ExportName, export_name.c_str());
-            strcpy(pars.OutputFilename, out_fname.c_str());
+            std::string fastdf_fname;
+            if (opengadget_memory) {
+                pars.ParticleSink = fastdf_memory_particle_sink;
+                pars.ParticleSinkContext = the_output_plugin.get();
+            } else {
+                // FastDF's direct append path can leave an empty particle group
+                // with some serial HDF5 builds. Write it independently and copy
+                // the completed group into the Gadget file below.
+                fastdf_fname = out_fname + ".fastdf-tmp.hdf5";
+                unlink(distributed_hdf5_filename(fastdf_fname).c_str());
+                strcpy(pars.OutputFilename, fastdf_fname.c_str());
+            }
             strcpy(pars.GaussianRandomFieldFile, white_noise_fname.c_str());
             strcpy(pars.GaussianRandomFieldDataset, white_noise_dset.c_str());
             strcpy(pars.TransferFunctionDensity, nupart_density_tfunc.c_str());
@@ -1163,7 +1249,13 @@ int run( config_file& the_config )
             strcpy(pars.ClassIniFile, class_parameter_file.c_str());
             strcpy(pars.VelocityType, velocity_type.c_str());
 
-            uint64_t num_local_nuparts = run_fastdf(&pars, &us);
+            const long long fastdf_result = run_fastdf(&pars, &us);
+            if (fastdf_result < 0)
+                throw std::runtime_error("FastDF particle generation or transfer failed");
+            const uint64_t num_local_nuparts = static_cast<uint64_t>(fastdf_result);
+
+            if (!opengadget_memory)
+                merge_fastdf_particle_group(fastdf_fname, out_fname, export_name);
 
             music::ilog << std::endl;
 
@@ -1182,4 +1274,3 @@ int run( config_file& the_config )
 
 
 } // end namespace ic_generator
-

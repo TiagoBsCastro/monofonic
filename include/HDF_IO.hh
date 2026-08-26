@@ -87,9 +87,12 @@ inline void AssertFileOpen( std::string Filename )
 
 inline void HDFCreateFile( std::string Filename )
 {
-  hid_t HDF_FileID;
-  HDF_FileID = H5Fcreate( Filename.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT );
+  hid_t HDF_FileID, HDF_Prop;
+  HDF_Prop = H5Pcreate(H5P_FILE_CREATE);
+  H5Pset_obj_track_times(HDF_Prop, false);
+  HDF_FileID = H5Fcreate( Filename.c_str(), H5F_ACC_TRUNC, HDF_Prop, H5P_DEFAULT );
   H5Fclose( HDF_FileID );
+  H5Pclose( HDF_Prop );
 }
 
 template< typename T>
@@ -641,12 +644,15 @@ inline void HDFWriteDataset( const std::string Filename, const std::string ObjNa
 
   HDF_Dims                = Data.size();
   HDF_DataspaceID         = H5Screate_simple(1, &HDF_Dims, NULL);
-  HDF_DatasetID           = H5Dcreate( HDF_FileID, ObjName.c_str(), HDF_Type,
-                                       HDF_DataspaceID, H5P_DEFAULT );
+  hid_t HDF_Prop          = H5Pcreate(H5P_DATASET_CREATE);
+  H5Pset_obj_track_times(HDF_Prop, false);
+  HDF_DatasetID           = H5Dcreate2( HDF_FileID, ObjName.c_str(), HDF_Type,
+                                        HDF_DataspaceID, H5P_DEFAULT, HDF_Prop, H5P_DEFAULT );
   H5Dwrite( HDF_DatasetID, HDF_Type, H5S_ALL, H5S_ALL,
             H5P_DEFAULT, &Data[0] );
   H5Dclose( HDF_DatasetID );
   H5Sclose( HDF_DataspaceID );
+  H5Pclose( HDF_Prop );
 
   H5Fclose( HDF_FileID );
 }
@@ -874,12 +880,15 @@ inline void HDFWriteDatasetVector( const std::string Filename, const std::string
   }
 
   HDF_DataspaceID         = H5Screate_simple(2, HDF_Dims, NULL);
-  HDF_DatasetID           = H5Dcreate( HDF_FileID, ObjName.c_str(), H5T_NATIVE_FLOAT,
-                                       HDF_DataspaceID, H5P_DEFAULT );
+  hid_t HDF_Prop          = H5Pcreate(H5P_DATASET_CREATE);
+  H5Pset_obj_track_times(HDF_Prop, false);
+  HDF_DatasetID           = H5Dcreate2( HDF_FileID, ObjName.c_str(), H5T_NATIVE_FLOAT,
+                                        HDF_DataspaceID, H5P_DEFAULT, HDF_Prop, H5P_DEFAULT );
   H5Dwrite( HDF_DatasetID, HDF_Type, H5S_ALL, H5S_ALL,
             H5P_DEFAULT, &Data[0] );
   H5Dclose( HDF_DatasetID );
   H5Sclose( HDF_DataspaceID );
+  H5Pclose( HDF_Prop );
 
   H5Fclose( HDF_FileID );
 }
@@ -1058,11 +1067,14 @@ inline void HDFWriteDatasetVectorChunk( const std::string Filename, const std::s
 
 inline void HDFCreateGroup( const std::string Filename, const std::string GroupName )
 {
-	hid_t HDF_FileID, HDF_GroupID;
+	hid_t HDF_FileID, HDF_GroupID, HDF_Prop;
 
 	HDF_FileID = H5Fopen( Filename.c_str(), H5F_ACC_RDWR, H5P_DEFAULT );
-	HDF_GroupID = H5Gcreate( HDF_FileID, GroupName.c_str(), 0 );
+	HDF_Prop = H5Pcreate(H5P_GROUP_CREATE);
+	H5Pset_obj_track_times(HDF_Prop, false);
+	HDF_GroupID = H5Gcreate2( HDF_FileID, GroupName.c_str(), H5P_DEFAULT, HDF_Prop, H5P_DEFAULT );
 	H5Gclose( HDF_GroupID );
+	H5Pclose( HDF_Prop );
 	H5Fclose( HDF_FileID );
 
 }

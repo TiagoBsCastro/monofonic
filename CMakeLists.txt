@@ -339,3 +339,28 @@ if(ENABLE_GENERICIO)
   target_link_libraries(${PRGNAME} PRIVATE genericio::genericio_mpi)
   target_compile_definitions(${PRGNAME} PRIVATE "ENABLE_GENERICIO")
 endif()
+
+########################################################################################################################
+# Embeddable library
+#
+# OpenGadget3 links this shared library when it is built with MONOFONIC.  Keep
+# the normal executable above unchanged so that it remains the authoritative
+# stand-alone reference implementation used by the equivalence test.
+set(MONOFONIC_CORE_SOURCES ${SOURCES})
+list(FILTER MONOFONIC_CORE_SOURCES EXCLUDE REGEX "/main\\.cc$")
+add_library(monofonic_core SHARED ${MONOFONIC_CORE_SOURCES} ${PLUGINS})
+set_target_properties(monofonic_core PROPERTIES CXX_STANDARD 14)
+
+get_target_property(MONOFONIC_COMPILE_DEFINITIONS ${PRGNAME} COMPILE_DEFINITIONS)
+if(MONOFONIC_COMPILE_DEFINITIONS)
+  target_compile_definitions(monofonic_core PRIVATE ${MONOFONIC_COMPILE_DEFINITIONS})
+endif()
+
+get_target_property(MONOFONIC_LINK_LIBRARIES ${PRGNAME} LINK_LIBRARIES)
+if(MONOFONIC_LINK_LIBRARIES)
+  target_link_libraries(monofonic_core PRIVATE ${MONOFONIC_LINK_LIBRARIES})
+endif()
+
+if(HDF5_FOUND)
+  target_include_directories(monofonic_core PRIVATE ${HDF5_INCLUDE_DIRS})
+endif()
