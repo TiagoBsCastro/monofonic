@@ -177,7 +177,7 @@ index 7bdd627..458f483 100644
  int fileExists(const char *fname) {
      int exists = 0;
 diff --git a/src/runner.c b/src/runner.c
-index c0c8a98..c2a30e5 100644
+index c0c8a98..b958e20 100644
 --- a/src/runner.c
 +++ b/src/runner.c
 @@ -38,6 +38,21 @@ long long run_fastdf(struct params *pars, struct units *us) {
@@ -213,7 +213,7 @@ index c0c8a98..c2a30e5 100644
      double *box;
      double BoxLen = 0;
      int N;
-@@ -193,9 +210,59 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -193,9 +210,71 @@ long long run_fastdf(struct params *pars, struct units *us) {
      header(verbosity_low, "Random phases");
      message(verbosity_low, "Reading Gaussian random field from %s (dataset %s).\n", pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset);
  
@@ -226,11 +226,14 @@ index c0c8a98..c2a30e5 100644
 +    MPI_Bcast(&N, 1, MPI_INT, 0, node_comm);
 +    MPI_Bcast(&BoxLen, 1, MPI_DOUBLE, 0, node_comm);
 +
-+    /* One shared window holding every grid (12 real + 9 complex N^3 grids) */
++    /* One shared window sized to the *peak* simultaneous footprint rather than
++     * the sum of all grids. Fixed slots: box (1 real) + fbox, fgrf (2 complex).
++     * Scratch slots: 7 real + 2 complex, reused across the three phases because
++     * the phase-1/2/3 grids have disjoint lifetimes. */
 +    size_t n3 = (size_t)N * N * N;
 +    size_t real_sz = n3 * sizeof(double);
 +    size_t cplx_sz = n3 * sizeof(fftw_complex);
-+    size_t total_sz = 12 * real_sz + 9 * cplx_sz;
++    size_t total_sz = 8 * real_sz + 4 * cplx_sz;
 +
 +    void *sh_base = NULL;
 +    MPI_Win sh_win;
@@ -239,29 +242,38 @@ index c0c8a98..c2a30e5 100644
 +    MPI_Aint sh_size; int sh_disp;
 +    MPI_Win_shared_query(sh_win, 0, &sh_size, &sh_disp, &sh_base);
 +
-+    /* Carve out the individual grids from the shared buffer */
++    /* Fixed grids (alive throughout) */
 +    char *shb = (char *)sh_base;
 +    box              = (double *)(shb + 0 * real_sz);
-+    double *box_dic  = (double *)(shb + 1 * real_sz);
-+    double *box_tic  = (double *)(shb + 2 * real_sz);
-+    double *box_phi0 = (double *)(shb + 3 * real_sz);
-+    double *box_phi1 = (double *)(shb + 4 * real_sz);
-+    double *box_psi0 = (double *)(shb + 5 * real_sz);
-+    double *box_psi1 = (double *)(shb + 6 * real_sz);
-+    double *box_phi  = (double *)(shb + 7 * real_sz);
-+    double *box_psi  = (double *)(shb + 8 * real_sz);
-+    double *box_phi_dot = (double *)(shb + 9 * real_sz);
-+    double *box_dshift  = (double *)(shb + 10 * real_sz);
-+    double *box_tshift  = (double *)(shb + 11 * real_sz);
-+    fftw_complex *fbox         = (fftw_complex *)(shb + 12 * real_sz + 0 * cplx_sz);
-+    fftw_complex *fgrf         = (fftw_complex *)(shb + 12 * real_sz + 1 * cplx_sz);
-+    fftw_complex *fbox_phi     = (fftw_complex *)(shb + 12 * real_sz + 2 * cplx_sz);
-+    fftw_complex *fbox_psi     = (fftw_complex *)(shb + 12 * real_sz + 3 * cplx_sz);
-+    fftw_complex *fbox_alpha   = (fftw_complex *)(shb + 12 * real_sz + 4 * cplx_sz);
-+    fftw_complex *fbox_hdot    = (fftw_complex *)(shb + 12 * real_sz + 5 * cplx_sz);
-+    fftw_complex *fbox_etadot  = (fftw_complex *)(shb + 12 * real_sz + 6 * cplx_sz);
-+    fftw_complex *fbox_Nbshift = (fftw_complex *)(shb + 12 * real_sz + 7 * cplx_sz);
-+    fftw_complex *fbox_HTNbp   = (fftw_complex *)(shb + 12 * real_sz + 8 * cplx_sz);
++    fftw_complex *fbox = (fftw_complex *)(shb + 1 * real_sz);
++    fftw_complex *fgrf = (fftw_complex *)(shb + 1 * real_sz + 1 * cplx_sz);
++
++    /* Scratch region (reused across phases) */
++    char *scr = shb + 1 * real_sz + 2 * cplx_sz;
++
++    /* Real grids: box_dic/box_phi0/box_dshift share slot 0;
++     * box_tic/box_phi1/box_tshift share slot 1. */
++    double *box_dic     = (double *)(scr + 0 * real_sz);
++    double *box_tic     = (double *)(scr + 1 * real_sz);
++    double *box_phi0    = (double *)(scr + 0 * real_sz);
++    double *box_phi1    = (double *)(scr + 1 * real_sz);
++    double *box_psi0    = (double *)(scr + 2 * real_sz);
++    double *box_psi1    = (double *)(scr + 3 * real_sz);
++    double *box_phi     = (double *)(scr + 4 * real_sz);
++    double *box_psi     = (double *)(scr + 5 * real_sz);
++    double *box_phi_dot = (double *)(scr + 6 * real_sz);
++    double *box_dshift  = (double *)(scr + 0 * real_sz);
++    double *box_tshift  = (double *)(scr + 1 * real_sz);
++
++    /* Complex grids: fbox_phi/fbox_psi use the tail of the scratch; the phase-3
++     * gauge temporaries overlap the phase-2 real slots (disjoint lifetimes). */
++    fftw_complex *fbox_phi     = (fftw_complex *)(scr + 7 * real_sz);
++    fftw_complex *fbox_psi     = (fftw_complex *)(scr + 7 * real_sz + 1 * cplx_sz);
++    fftw_complex *fbox_hdot    = (fftw_complex *)(scr + 2 * real_sz);
++    fftw_complex *fbox_etadot  = (fftw_complex *)(scr + 4 * real_sz);
++    fftw_complex *fbox_Nbshift = (fftw_complex *)(scr + 6 * real_sz);
++    fftw_complex *fbox_alpha   = (fftw_complex *)(scr + 8 * real_sz);
++    fftw_complex *fbox_HTNbp   = (fftw_complex *)(scr + 2 * real_sz);
 +
 +    /* node_rank 0 reads the white-noise field into the shared window */
 +    if (node_rank == 0)
@@ -276,7 +288,7 @@ index c0c8a98..c2a30e5 100644
  
      /* Override the box length? */
      if (BoxLen > 0.) {
-@@ -219,65 +286,74 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -219,65 +298,74 @@ long long run_fastdf(struct params *pars, struct units *us) {
          exit(1);
      }
  
@@ -396,7 +408,7 @@ index c0c8a98..c2a30e5 100644
  
      /* Do we need to apply the primordial power spectrum? */
      if (pars->NormalizeGaussianField || pars->AssumeMonofonicNormalization) {
-@@ -296,11 +372,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -296,11 +384,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
          message(verbosity_low, "beta_s = %.5g\n", ps.beta_s);
  
          /* Apply the bare power spectrum to fbox */
@@ -412,7 +424,7 @@ index c0c8a98..c2a30e5 100644
  
      /* Find the relevant density title among the transfer functions */
      char *title = pars->TransferFunctionDensity;
-@@ -382,10 +459,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -382,10 +471,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
      double z_begin = 1./a_begin - 1;
      double log_tau_begin = perturbLogTauAtRedshift(&spline, z_begin);
  
@@ -424,7 +436,7 @@ index c0c8a98..c2a30e5 100644
  
      header(verbosity_low, "Generating pre-initial conditions");
      message(verbosity_low, "Generating pre-initial grids.\n");
-@@ -407,24 +481,31 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -407,24 +493,31 @@ long long run_fastdf(struct params *pars, struct units *us) {
          struct spline_params sp = {&spline, index_psi, tau_index, u_tau};
  
          /* Apply the transfer function (read only fgrf, output into fbox) */
@@ -465,7 +477,7 @@ index c0c8a98..c2a30e5 100644
          if (rank == 0 && pars->OutputFields) {
              char dnu_fname[50];
              sprintf(dnu_fname, "%s/ic_dnu.hdf5", pars->OutputDirectory);
-@@ -490,9 +571,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -490,9 +583,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
          p->v_i_mag = hypot3(p->v[0], p->v[1], p->v[2]);
      }
  
@@ -476,7 +488,7 @@ index c0c8a98..c2a30e5 100644
  
      message(verbosity_low, "Done with pre-initial conditions.\n");
  
-@@ -524,23 +603,8 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -524,23 +615,8 @@ long long run_fastdf(struct params *pars, struct units *us) {
  
      message(verbosity_high, "     ITER a         z         I            recompute\n");
  
@@ -502,7 +514,7 @@ index c0c8a98..c2a30e5 100644
  
      /* Transer functions evaluated at a reference scale during the last update */
      double Tk_phi = 0.0;
-@@ -662,7 +726,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -662,7 +738,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
              Tk_psi = Tk_psi_curr;
  
              /* Copy the current boxes at t=t1 to the slots for t=t0 */
@@ -511,7 +523,7 @@ index c0c8a98..c2a30e5 100644
                  memcpy(box_phi0, box_phi1, N*N*N*sizeof(double));
                  memcpy(box_psi0, box_psi1, N*N*N*sizeof(double));
              }
-@@ -674,19 +738,23 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -674,19 +750,23 @@ long long run_fastdf(struct params *pars, struct units *us) {
              struct spline_params sp_psi_curr = {&spline, index_psi, tau_idx_major_next, u_major_next};
  
              /* Apply the transfer function (read only fgrf, output into fbox) */
@@ -548,7 +560,7 @@ index c0c8a98..c2a30e5 100644
          }
  
          /* Skip the particle integration during the first step */
-@@ -695,17 +763,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -695,17 +775,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
  
          /* Linearly interpolate the potentials to the current time step */
          double o = (log_tau - log_tau_major_prev) / (log_tau_major_next - log_tau_major_prev);
@@ -570,7 +582,7 @@ index c0c8a98..c2a30e5 100644
          if (rank == 0 && ((pars->OutputFields > 1 && recompute) || (pars->OutputFields > 2 && ITER % 10 == 0))) {
              char psi_fname[50];
              sprintf(psi_fname, "%s/psi_%d.hdf5", pars->OutputDirectory, ITER);
-@@ -808,13 +878,15 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -808,13 +890,15 @@ long long run_fastdf(struct params *pars, struct units *us) {
              p->x[1] += p->v[1] * drift * dtau;
              p->x[2] += p->v[2] * drift * dtau;
          }
@@ -587,7 +599,7 @@ index c0c8a98..c2a30e5 100644
  
          /* Integrate the particles during the second half-step */
          #pragma omp parallel for
-@@ -883,6 +955,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -883,6 +967,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
              p->v[1] += q_vec[1] * phi_dot_c2 * dtau2;
              p->v[2] += q_vec[2] * phi_dot_c2 * dtau2;
          }
@@ -595,7 +607,7 @@ index c0c8a98..c2a30e5 100644
  
          /* Step forward */
          a = a_next;
-@@ -913,22 +986,11 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -913,22 +998,11 @@ long long run_fastdf(struct params *pars, struct units *us) {
          }
      }
  
@@ -620,7 +632,7 @@ index c0c8a98..c2a30e5 100644
  
          header(verbosity_low, "Generating N-body gauge transformation grid");
  
-@@ -974,28 +1036,20 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -974,28 +1048,20 @@ long long run_fastdf(struct params *pars, struct units *us) {
              struct spline_params sp_Nbshift = {&spline, index_Nbshift, tau_index, u_tau};
              struct spline_params sp_HTNbp = {&spline, index_HTNbp, tau_index, u_tau};
  
@@ -655,7 +667,7 @@ index c0c8a98..c2a30e5 100644
  
              /* Compute the conformal time derivative of the background density */
              double Omega_nu = perturbDensityAtLogTau(&spline, log_tau_end, index_ncdm);
-@@ -1020,19 +1074,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -1020,19 +1086,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
              double rho_dot_rho_c4 = rho_dot_rho / (c * c * c * c);
  
              /* Compute the total density gauge shift */
@@ -685,7 +697,7 @@ index c0c8a98..c2a30e5 100644
  
              if (rank == 0 && pars->OutputFields) {
                  char density_fname[50];
-@@ -1040,29 +1094,29 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -1040,29 +1106,29 @@ long long run_fastdf(struct params *pars, struct units *us) {
                  writeFieldFile(box_dshift, N, BoxLen, density_fname);
              }
  
@@ -728,7 +740,7 @@ index c0c8a98..c2a30e5 100644
          }
  
          message(verbosity_low, "Applying N-body gauge transformation to the particles.\n");
-@@ -1097,15 +1151,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -1097,15 +1163,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
              p->v[2] += vel[2] * inv_c * eps_eV * a_end;
          }
  
