@@ -40,6 +40,39 @@ if(NOT fastdf_POPULATED)
         endif()
     endif()
 
+    # Put every FastDF grid in a single per-node shared-memory window
+    # (MPI_Win_allocate_shared). node_rank 0 reads/computes each grid once, the
+    # element-wise operations (kernels, normalisation, interpolation) are
+    # block-decomposed across the node's ranks, and the FFTs run on node_rank 0
+    # with all node threads, so ranks on the same node stop holding redundant
+    # full copies of the grids.
+    set(FASTDF_SHARED_NOISE_PATCH "${CMAKE_CURRENT_LIST_DIR}/fastdf-shared-white-noise.patch")
+    execute_process(
+        COMMAND git apply --check "${FASTDF_SHARED_NOISE_PATCH}"
+        WORKING_DIRECTORY "${fastdf_SOURCE_DIR}"
+        RESULT_VARIABLE FASTDF_SHARED_PATCH_CHECK
+        OUTPUT_QUIET
+        ERROR_QUIET)
+    if(FASTDF_SHARED_PATCH_CHECK EQUAL 0)
+        execute_process(
+            COMMAND git apply "${FASTDF_SHARED_NOISE_PATCH}"
+            WORKING_DIRECTORY "${fastdf_SOURCE_DIR}"
+            RESULT_VARIABLE FASTDF_SHARED_PATCH_RESULT)
+        if(NOT FASTDF_SHARED_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR "Failed to apply the FastDF shared white-noise patch")
+        endif()
+    else()
+        execute_process(
+            COMMAND git apply --reverse --check "${FASTDF_SHARED_NOISE_PATCH}"
+            WORKING_DIRECTORY "${fastdf_SOURCE_DIR}"
+            RESULT_VARIABLE FASTDF_SHARED_PATCH_REVERSE_CHECK
+            OUTPUT_QUIET
+            ERROR_QUIET)
+        if(NOT FASTDF_SHARED_PATCH_REVERSE_CHECK EQUAL 0)
+            message(FATAL_ERROR "FastDF source does not match the pinned shared white-noise patch")
+        endif()
+    endif()
+
     # FastDF uses a fixed HDF5 chunk length of 65536.  HDF5 rejects that
     # layout when generating fewer particles (including the required 32^3
     # smoke case), while FastDF does not check the H5Dcreate return value.
