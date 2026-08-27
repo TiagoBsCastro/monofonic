@@ -80,64 +80,125 @@ index 47db388..23fe58b 100644
              for (int z=0; z<=N/2; z++) {
                  /* Calculate the wavevector */
 diff --git a/src/input.c b/src/input.c
-index 7bdd627..458f483 100644
+index 7bdd627..24b4d28 100644
 --- a/src/input.c
 +++ b/src/input.c
-@@ -463,6 +463,92 @@ int readFieldFile_MPI(double **box, int *N, double *box_len, MPI_Comm comm,
+@@ -463,6 +463,182 @@ int readFieldFile_MPI(double **box, int *N, double *box_len, MPI_Comm comm,
  #endif
  }
  
 +/* Read only the grid size N and box length from the white-noise file.
 + * This is called by node_rank 0; the caller broadcasts the result to the
-+ * other ranks in the node. */
++ * other ranks in the node.  Every HDF5 handle is checked and every error path
++ * closes the handles it has opened and frees the temporary allocations, so an
++ * early return cannot leak handles or memory. */
 +int readFieldHeader(int *N, double *box_len, const char *fname, const char *dset_name) {
-+    /* Open the hdf5 file */
++    /* Suppress HDF5's automatic error stack so that expected failures (missing
++     * file, missing dataset) are reported cleanly by the caller. */
++    H5Eset_auto1(NULL, NULL);
++
 +    hid_t h_file = H5Fopen(fname, H5F_ACC_RDONLY, H5P_DEFAULT);
++    if (h_file < 0) {
++        printf("Error: could not open white-noise file '%s'.\n", fname);
++        return 1;
++    }
 +
-+    /* Check if the Header group exists */
-+    hid_t h_status = H5Eset_auto1(NULL, NULL); // turn off error printing
-+    h_status = H5Gget_objinfo(h_file, "/Header", 0, NULL);
-+
-+    /* If the group exists, read the box size attribute */
-+    if (h_status == 0) {
++    /* Read the BoxSize attribute from the Header group if present. */
++    htri_t h_exists = H5Lexists(h_file, "/Header", H5P_DEFAULT);
++    if (h_exists < 0) {
++        H5Fclose(h_file);
++        return 1;
++    }
++    if (h_exists > 0) {
 +        hid_t h_grp = H5Gopen(h_file, "Header", H5P_DEFAULT);
++        if (h_grp < 0) {
++            H5Fclose(h_file);
++            return 1;
++        }
 +        hid_t h_attr = H5Aopen(h_grp, "BoxSize", H5P_DEFAULT);
++        if (h_attr < 0) {
++            H5Gclose(h_grp);
++            H5Fclose(h_file);
++            return 1;
++        }
 +        double boxsize[3];
 +        if (H5Aread(h_attr, H5T_NATIVE_DOUBLE, &boxsize) < 0) {
 +            printf("Error reading hdf5 attribute '%s'.\n", "BoxSize");
++            H5Aclose(h_attr);
++            H5Gclose(h_grp);
++            H5Fclose(h_file);
 +            return 1;
 +        }
-+        assert(boxsize[0] == boxsize[1]);
-+        assert(boxsize[1] == boxsize[2]);
-+        *box_len = boxsize[0];
 +        H5Aclose(h_attr);
 +        H5Gclose(h_grp);
++        if (boxsize[0] != boxsize[1] || boxsize[1] != boxsize[2]) {
++            printf("Error: non-cubic box size (%g, %g, %g).\n", boxsize[0], boxsize[1], boxsize[2]);
++            H5Fclose(h_file);
++            return 2;
++        }
++        *box_len = boxsize[0];
 +    }
 +
-+    /* Open the Field dataset and fetch the grid dimensions */
++    /* Open the dataset and fetch the grid dimensions. */
 +    hid_t h_data = H5Dopen2(h_file, dset_name, H5P_DEFAULT);
++    if (h_data < 0) {
++        printf("Error: could not open dataset '%s'.\n", dset_name);
++        H5Fclose(h_file);
++        return 1;
++    }
 +    hid_t h_space = H5Dget_space(h_data);
++    if (h_space < 0) {
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
 +    int ndims = H5Sget_simple_extent_ndims(h_space);
++    if (ndims < 0) {
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
 +    hsize_t *dims = malloc(ndims * sizeof(hsize_t));
-+    H5Sget_simple_extent_dims(h_space, dims, NULL);
-+    int read_N = dims[0];
++    if (dims == NULL) {
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
++    if (H5Sget_simple_extent_dims(h_space, dims, NULL) < 0) {
++        free(dims);
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
 +
-+    /* We should be in 3D */
++    /* It should be 3D and cubic (but allow padding in the last dimension). */
 +    if (ndims != 3) {
 +        printf("Number of dimensions %d != 3.\n", ndims);
++        free(dims);
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
 +        return 2;
 +    }
-+    /* It should be a cube (but allow for padding in the last dimension) */
-+    if (read_N != dims[1] || (read_N != dims[2] && (read_N + 2) != dims[2])) {
-+        printf("Non-cubic grid size (%lld, %lld, %lld).\n", dims[0], dims[1], dims[2]);
++    int read_N = (int)dims[0];
++    if (read_N != (int)dims[1] || (read_N != (int)dims[2] && (read_N + 2) != (int)dims[2])) {
++        printf("Non-cubic grid size (%lld, %lld, %lld).\n",
++               (long long)dims[0], (long long)dims[1], (long long)dims[2]);
++        free(dims);
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
 +        return 2;
 +    }
 +    *N = read_N;
 +
++    free(dims);
 +    H5Sclose(h_space);
 +    H5Dclose(h_data);
 +    H5Fclose(h_file);
-+    free(dims);
 +
 +    return 0;
 +}
@@ -145,24 +206,53 @@ index 7bdd627..458f483 100644
 +/* Read the full N^3 white-noise field into a pre-allocated buffer.
 + * Called by node_rank 0; the field is then shared via a memory window. */
 +int readFieldBody(double *box, const char *fname, const char *dset_name, int N) {
-+    /* Open the hdf5 file */
++    H5Eset_auto1(NULL, NULL);
++
 +    hid_t h_file = H5Fopen(fname, H5F_ACC_RDONLY, H5P_DEFAULT);
++    if (h_file < 0) {
++        printf("Error: could not open white-noise file '%s'.\n", fname);
++        return 1;
++    }
 +
-+    /* Open the Field dataset */
 +    hid_t h_data = H5Dopen2(h_file, dset_name, H5P_DEFAULT);
++    if (h_data < 0) {
++        printf("Error: could not open dataset '%s'.\n", dset_name);
++        H5Fclose(h_file);
++        return 1;
++    }
 +    hid_t h_space = H5Dget_space(h_data);
++    if (h_space < 0) {
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
 +
-+    /* The hyperslab that should be read (needed in case of padding) */
++    /* The hyperslab that should be read (needed in case of padding). */
 +    const hsize_t space_rank = 3;
-+    const hsize_t space_dims[3] = {N, N, N};
++    const hsize_t space_dims[3] = {(hsize_t)N, (hsize_t)N, (hsize_t)N};
 +    const hsize_t space_offset[3] = {0, 0, 0};
 +
 +    hid_t h_memspace = H5Screate_simple(space_rank, space_dims, NULL);
-+    H5Sselect_hyperslab(h_space, H5S_SELECT_SET, space_offset, NULL, space_dims, NULL);
++    if (h_memspace < 0) {
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
++    if (H5Sselect_hyperslab(h_space, H5S_SELECT_SET, space_offset, NULL, space_dims, NULL) < 0) {
++        H5Sclose(h_memspace);
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
 +
-+    hid_t h_err = H5Dread(h_data, H5T_NATIVE_DOUBLE, h_memspace, h_space, H5P_DEFAULT, box);
-+    if (h_err < 0) {
++    if (H5Dread(h_data, H5T_NATIVE_DOUBLE, h_memspace, h_space, H5P_DEFAULT, box) < 0) {
 +        printf("Error reading hdf5 file '%s'.\n", fname);
++        H5Sclose(h_memspace);
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
 +        return 1;
 +    }
 +
@@ -177,10 +267,36 @@ index 7bdd627..458f483 100644
  int fileExists(const char *fname) {
      int exists = 0;
 diff --git a/src/runner.c b/src/runner.c
-index c0c8a98..b958e20 100644
+index c0c8a98..63e12fd 100644
 --- a/src/runner.c
 +++ b/src/runner.c
-@@ -38,6 +38,21 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -24,9 +24,25 @@
+ #include <assert.h>
+ #include <math.h>
+ #include <sys/time.h>
++#ifdef _OPENMP
++#include <omp.h>
++#endif
+ 
+ #include "../include/fastdf.h"
+ 
++/* Synchronize shared-memory access to the grid window. The grids are accessed
++ * with ordinary C loads/stores (not MPI RMA). MPI_Win_fence synchronizes all
++ * node-local ranks and establishes the exposure epoch that makes those
++ * loads/stores visible. The lighter MPI_Win_sync + MPI_Barrier pair cannot be
++ * used here: MPI_Win_sync requires an active RMA exposure epoch and fails with
++ * MPI_ERR_RMA_SYNC ("Wrong synchronization of RMA calls") when called without
++ * one (observed on MPICH). Correctness therefore takes priority over reducing
++ * synchronization overhead, so we keep MPI_Win_fence. */
++static inline void shared_grid_sync(MPI_Win win, MPI_Comm comm) {
++    (void)comm;
++    MPI_Win_fence(0, win);
++}
++
+ // Returns the number of local particles generated
+ long long run_fastdf(struct params *pars, struct units *us) {
+     
+@@ -38,6 +54,31 @@ long long run_fastdf(struct params *pars, struct units *us) {
      MPI_Comm_rank(MPI_COMM_WORLD, &rank);
      MPI_Comm_size(MPI_COMM_WORLD, &MPI_Rank_Count);
  
@@ -191,18 +307,28 @@ index c0c8a98..b958e20 100644
 +    MPI_Comm_rank(node_comm, &node_rank);
 +    MPI_Comm_size(node_comm, &node_size);
 +
-+    /* Let the FFT (executed by node_rank 0) use all threads of the node */
-+    int omp_threads = 1;
-+    const char *omp_env = getenv("OMP_NUM_THREADS");
-+    if (omp_env) omp_threads = atoi(omp_env);
-+    if (omp_threads < 1) omp_threads = 1;
-+    fftw_init_threads();
-+    fftw_plan_with_nthreads(node_size * omp_threads);
++    /* Use the OpenMP threads available to this rank for the FFTs executed by
++     * node_rank 0. monofonIC already set this to CONFIG::num_threads via
++     * omp_set_num_threads(), so omp_get_max_threads() returns that value. We
++     * deliberately do NOT multiply by node_size: under normal MPI CPU binding
++     * rank 0 cannot safely use the CPUs assigned to the other node-local ranks.
++     * Because this matches the thread count the host already configured with
++     * fftw_plan_with_nthreads(), the FFTW planner state is unchanged and nothing
++     * needs to be restored before returning. */
++    int fft_threads = 1;
++#ifdef _OPENMP
++    fft_threads = omp_get_max_threads();
++    if (fft_threads < 1) fft_threads = 1;
++#endif
++#ifdef USE_FFTW_THREADS
++    fftw_init_threads();  /* idempotent; the host already called it */
++    fftw_plan_with_nthreads(fft_threads);
++#endif
 +
      /* The level of verbosity */
      const int verbosity = pars->Verbosity;
      const int verbosity_low = rank + (verbosity == 0); // low priority
-@@ -185,7 +200,9 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -185,7 +226,9 @@ long long run_fastdf(struct params *pars, struct units *us) {
          message(verbosity_low, "\n\n");
      }
  
@@ -213,27 +339,47 @@ index c0c8a98..b958e20 100644
      double *box;
      double BoxLen = 0;
      int N;
-@@ -193,9 +210,71 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -193,9 +236,104 @@ long long run_fastdf(struct params *pars, struct units *us) {
      header(verbosity_low, "Random phases");
      message(verbosity_low, "Reading Gaussian random field from %s (dataset %s).\n", pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset);
  
 -    readFieldFileDataSet(&box, &N, &BoxLen, pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset);
 -    // readFieldFile(&box, &N, &BoxLen, pars->GaussianRandomFieldFile);
 -    // readFieldFile_MPI(&box, &N, &BoxLen, MPI_COMM_WORLD, pars->GaussianRandomFieldFile);
-+    /* Read the grid size + box length on node_rank 0, broadcast within the node */
++    /* Read the grid size + box length on node_rank 0, then broadcast the I/O
++     * status before the values so every node rank observes a failure
++     * consistently (and never uses an uninitialized N to size the window). */
++    int io_status = 0;
 +    if (node_rank == 0)
-+        readFieldHeader(&N, &BoxLen, pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset);
++        io_status = readFieldHeader(&N, &BoxLen, pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset);
++    MPI_Bcast(&io_status, 1, MPI_INT, 0, node_comm);
++    if (io_status != 0) {
++        printf("Error: could not read the white-noise header (status %d).\n", io_status);
++        MPI_Comm_free(&node_comm);
++        cleanPerturb(&ptdat);
++        cleanPerturbParams(&ptpars);
++        cleanPerturbSpline(&spline);
++        return 1;
++    }
 +    MPI_Bcast(&N, 1, MPI_INT, 0, node_comm);
 +    MPI_Bcast(&BoxLen, 1, MPI_DOUBLE, 0, node_comm);
 +
 +    /* One shared window sized to the *peak* simultaneous footprint rather than
 +     * the sum of all grids. Fixed slots: box (1 real) + fbox, fgrf (2 complex).
 +     * Scratch slots: 7 real + 2 complex, reused across the three phases because
-+     * the phase-1/2/3 grids have disjoint lifetimes. */
++     * the phase-1/2/3 grids have disjoint lifetimes.
++     *
++     * Complex grids use the FFTW r2c half layout: an N^3 real grid is stored as
++     * N x N x (N/2 + 1) complex values. real_sz is rounded up to a multiple of
++     * sizeof(fftw_complex) (16 bytes) so every complex grid carved after a run
++     * of real slots stays 16-byte aligned even when N is odd. */
 +    size_t n3 = (size_t)N * N * N;
-+    size_t real_sz = n3 * sizeof(double);
-+    size_t cplx_sz = n3 * sizeof(fftw_complex);
-+    size_t total_sz = 8 * real_sz + 4 * cplx_sz;
++    size_t nc = (size_t)N * N * (N / 2 + 1);       /* r2c half-complex count */
++    size_t real_sz = n3 * sizeof(double);           /* real grid data size */
++    size_t real_stride = (real_sz + sizeof(fftw_complex) - 1)
++                         & ~((size_t)sizeof(fftw_complex) - 1); /* 16-byte aligned */
++    size_t cplx_sz = nc * sizeof(fftw_complex);     /* already 16-byte aligned */
++    size_t total_sz = 8 * real_stride + 4 * cplx_sz;
 +
 +    void *sh_base = NULL;
 +    MPI_Win sh_win;
@@ -244,41 +390,54 @@ index c0c8a98..b958e20 100644
 +
 +    /* Fixed grids (alive throughout) */
 +    char *shb = (char *)sh_base;
-+    box              = (double *)(shb + 0 * real_sz);
-+    fftw_complex *fbox = (fftw_complex *)(shb + 1 * real_sz);
-+    fftw_complex *fgrf = (fftw_complex *)(shb + 1 * real_sz + 1 * cplx_sz);
++    box              = (double *)(shb + 0 * real_stride);
++    fftw_complex *fbox = (fftw_complex *)(shb + 1 * real_stride);
++    fftw_complex *fgrf = (fftw_complex *)(shb + 1 * real_stride + 1 * cplx_sz);
 +
 +    /* Scratch region (reused across phases) */
-+    char *scr = shb + 1 * real_sz + 2 * cplx_sz;
++    char *scr = shb + 1 * real_stride + 2 * cplx_sz;
 +
 +    /* Real grids: box_dic/box_phi0/box_dshift share slot 0;
 +     * box_tic/box_phi1/box_tshift share slot 1. */
-+    double *box_dic     = (double *)(scr + 0 * real_sz);
-+    double *box_tic     = (double *)(scr + 1 * real_sz);
-+    double *box_phi0    = (double *)(scr + 0 * real_sz);
-+    double *box_phi1    = (double *)(scr + 1 * real_sz);
-+    double *box_psi0    = (double *)(scr + 2 * real_sz);
-+    double *box_psi1    = (double *)(scr + 3 * real_sz);
-+    double *box_phi     = (double *)(scr + 4 * real_sz);
-+    double *box_psi     = (double *)(scr + 5 * real_sz);
-+    double *box_phi_dot = (double *)(scr + 6 * real_sz);
-+    double *box_dshift  = (double *)(scr + 0 * real_sz);
-+    double *box_tshift  = (double *)(scr + 1 * real_sz);
++    double *box_dic     = (double *)(scr + 0 * real_stride);
++    double *box_tic     = (double *)(scr + 1 * real_stride);
++    double *box_phi0    = (double *)(scr + 0 * real_stride);
++    double *box_phi1    = (double *)(scr + 1 * real_stride);
++    double *box_psi0    = (double *)(scr + 2 * real_stride);
++    double *box_psi1    = (double *)(scr + 3 * real_stride);
++    double *box_phi     = (double *)(scr + 4 * real_stride);
++    double *box_psi     = (double *)(scr + 5 * real_stride);
++    double *box_phi_dot = (double *)(scr + 6 * real_stride);
++    double *box_dshift  = (double *)(scr + 0 * real_stride);
++    double *box_tshift  = (double *)(scr + 1 * real_stride);
 +
 +    /* Complex grids: fbox_phi/fbox_psi use the tail of the scratch; the phase-3
-+     * gauge temporaries overlap the phase-2 real slots (disjoint lifetimes). */
-+    fftw_complex *fbox_phi     = (fftw_complex *)(scr + 7 * real_sz);
-+    fftw_complex *fbox_psi     = (fftw_complex *)(scr + 7 * real_sz + 1 * cplx_sz);
-+    fftw_complex *fbox_hdot    = (fftw_complex *)(scr + 2 * real_sz);
-+    fftw_complex *fbox_etadot  = (fftw_complex *)(scr + 4 * real_sz);
-+    fftw_complex *fbox_Nbshift = (fftw_complex *)(scr + 6 * real_sz);
-+    fftw_complex *fbox_alpha   = (fftw_complex *)(scr + 8 * real_sz);
-+    fftw_complex *fbox_HTNbp   = (fftw_complex *)(scr + 2 * real_sz);
++     * gauge temporaries overlap the phase-2 real slots (disjoint lifetimes).
++     * Since cplx_sz < 2 * real_stride for N >= 2, each complex temporary fits
++     * within the two real slots it is aliased onto. */
++    fftw_complex *fbox_phi     = (fftw_complex *)(scr + 7 * real_stride);
++    fftw_complex *fbox_psi     = (fftw_complex *)(scr + 7 * real_stride + 1 * cplx_sz);
++    fftw_complex *fbox_hdot    = (fftw_complex *)(scr + 2 * real_stride);
++    fftw_complex *fbox_etadot  = (fftw_complex *)(scr + 4 * real_stride);
++    fftw_complex *fbox_Nbshift = (fftw_complex *)(scr + 6 * real_stride);
++    fftw_complex *fbox_alpha   = (fftw_complex *)(scr + 8 * real_stride);
++    fftw_complex *fbox_HTNbp   = (fftw_complex *)(scr + 2 * real_stride);
 +
-+    /* node_rank 0 reads the white-noise field into the shared window */
++    /* node_rank 0 reads the white-noise field into the shared window; the status
++     * is broadcast so every node rank observes a failure consistently. */
 +    if (node_rank == 0)
-+        readFieldBody(box, pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset, N);
-+    MPI_Win_fence(0, sh_win);
++        io_status = readFieldBody(box, pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset, N);
++    MPI_Bcast(&io_status, 1, MPI_INT, 0, node_comm);
++    if (io_status != 0) {
++        printf("Error: could not read the white-noise field (status %d).\n", io_status);
++        MPI_Win_free(&sh_win);
++        MPI_Comm_free(&node_comm);
++        cleanPerturb(&ptdat);
++        cleanPerturbParams(&ptpars);
++        cleanPerturbSpline(&spline);
++        return 1;
++    }
++    shared_grid_sync(sh_win, node_comm);
 +
 +    /* x-range and flat-range each node rank fills (block decomposition) */
 +    const int x0 = node_rank * N / node_size;
@@ -288,7 +447,7 @@ index c0c8a98..b958e20 100644
  
      /* Override the box length? */
      if (BoxLen > 0.) {
-@@ -219,65 +298,74 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -219,65 +357,74 @@ long long run_fastdf(struct params *pars, struct units *us) {
          exit(1);
      }
  
@@ -385,7 +544,7 @@ index c0c8a98..b958e20 100644
 +            }
          }
      }
-+    MPI_Win_fence(0, sh_win);
++    shared_grid_sync(sh_win, node_comm);
 +
 +    /* Fourier transform the Gaussian random field (node_rank 0 only; it uses
 +     * all node threads via fftw_plan_with_nthreads). */
@@ -394,7 +553,7 @@ index c0c8a98..b958e20 100644
 +        fft_execute(r2c);
 +        fftw_destroy_plan(r2c);
 +    }
-+    MPI_Win_fence(0, sh_win);
++    shared_grid_sync(sh_win, node_comm);
  
 -    /* Fourier transform the Gaussian random field */
 -    fftw_complex *fbox = malloc(N*N*N*sizeof(fftw_complex));
@@ -408,7 +567,7 @@ index c0c8a98..b958e20 100644
  
      /* Do we need to apply the primordial power spectrum? */
      if (pars->NormalizeGaussianField || pars->AssumeMonofonicNormalization) {
-@@ -296,11 +384,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -296,11 +443,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
          message(verbosity_low, "beta_s = %.5g\n", ps.beta_s);
  
          /* Apply the bare power spectrum to fbox */
@@ -424,7 +583,7 @@ index c0c8a98..b958e20 100644
  
      /* Find the relevant density title among the transfer functions */
      char *title = pars->TransferFunctionDensity;
-@@ -382,10 +471,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -382,10 +530,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
      double z_begin = 1./a_begin - 1;
      double log_tau_begin = perturbLogTauAtRedshift(&spline, z_begin);
  
@@ -436,27 +595,27 @@ index c0c8a98..b958e20 100644
  
      header(verbosity_low, "Generating pre-initial conditions");
      message(verbosity_low, "Generating pre-initial grids.\n");
-@@ -407,24 +493,31 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -407,24 +552,31 @@ long long run_fastdf(struct params *pars, struct units *us) {
          struct spline_params sp = {&spline, index_psi, tau_index, u_tau};
  
          /* Apply the transfer function (read only fgrf, output into fbox) */
 -        fft_apply_kernel(fbox, fgrf, N, BoxLen, kernel_transfer_function, &sp);
 +        fft_apply_kernel(fbox, fgrf, N, BoxLen, kernel_transfer_function, &sp, x0, x1);
++
++        /* Fourier transform to real space (node_rank 0 only) */
++        shared_grid_sync(sh_win, node_comm);
++        if (node_rank == 0) {
++            fftw_plan c2r = fftw_plan_dft_c2r_3d(N, N, N, fbox, box, FFTW_ESTIMATE);
++            fft_execute(c2r);
++            fftw_destroy_plan(c2r);
++        }
++        shared_grid_sync(sh_win, node_comm);
  
 -        /* Fourier transform to real space */
 -        fftw_plan c2r = fftw_plan_dft_c2r_3d(N, N, N, fbox, box, FFTW_ESTIMATE);
 -        fft_execute(c2r);
 -        fft_normalize_c2r(box, N, BoxLen);
 -        fftw_destroy_plan(c2r);
-+        /* Fourier transform to real space (node_rank 0 only) */
-+        MPI_Win_fence(0, sh_win);
-+        if (node_rank == 0) {
-+            fftw_plan c2r = fftw_plan_dft_c2r_3d(N, N, N, fbox, box, FFTW_ESTIMATE);
-+            fft_execute(c2r);
-+            fftw_destroy_plan(c2r);
-+        }
-+        MPI_Win_fence(0, sh_win);
-+
 +        fft_normalize_c2r(box, N, BoxLen, x0, x1);
  
          /* Copy into the boxes for the density and velocity perturbations */
@@ -472,12 +631,12 @@ index c0c8a98..b958e20 100644
              box_tic[i] *= 0.5 * exp(log_tau_begin);
          }
  
-+        MPI_Win_fence(0, sh_win);
++        shared_grid_sync(sh_win, node_comm);
 +
          if (rank == 0 && pars->OutputFields) {
              char dnu_fname[50];
              sprintf(dnu_fname, "%s/ic_dnu.hdf5", pars->OutputDirectory);
-@@ -490,9 +583,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -490,9 +642,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
          p->v_i_mag = hypot3(p->v[0], p->v[1], p->v[2]);
      }
  
@@ -488,7 +647,7 @@ index c0c8a98..b958e20 100644
  
      message(verbosity_low, "Done with pre-initial conditions.\n");
  
-@@ -524,23 +615,8 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -524,23 +674,8 @@ long long run_fastdf(struct params *pars, struct units *us) {
  
      message(verbosity_high, "     ITER a         z         I            recompute\n");
  
@@ -514,7 +673,7 @@ index c0c8a98..b958e20 100644
  
      /* Transer functions evaluated at a reference scale during the last update */
      double Tk_phi = 0.0;
-@@ -662,7 +738,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -662,7 +797,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
              Tk_psi = Tk_psi_curr;
  
              /* Copy the current boxes at t=t1 to the slots for t=t0 */
@@ -523,7 +682,7 @@ index c0c8a98..b958e20 100644
                  memcpy(box_phi0, box_phi1, N*N*N*sizeof(double));
                  memcpy(box_psi0, box_psi1, N*N*N*sizeof(double));
              }
-@@ -674,19 +750,23 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -674,19 +809,23 @@ long long run_fastdf(struct params *pars, struct units *us) {
              struct spline_params sp_psi_curr = {&spline, index_psi, tau_idx_major_next, u_major_next};
  
              /* Apply the transfer function (read only fgrf, output into fbox) */
@@ -544,7 +703,7 @@ index c0c8a98..b958e20 100644
 +            fft_apply_kernel(fbox_psi, fgrf, N, BoxLen, kernel_transfer_function, &sp_psi_curr, x0, x1);
 +
 +            /* Fourier transform to real space (node_rank 0 only) */
-+            MPI_Win_fence(0, sh_win);
++            shared_grid_sync(sh_win, node_comm);
 +            if (node_rank == 0) {
 +                fftw_plan c2r = fftw_plan_dft_c2r_3d(N, N, N, fbox_phi, box_phi1, FFTW_ESTIMATE);
 +                fft_execute(c2r);
@@ -556,11 +715,11 @@ index c0c8a98..b958e20 100644
 +                fft_normalize_c2r(box_psi1, N, BoxLen, 0, N);
 +                fftw_destroy_plan(c2r2);
 +            }
-+            MPI_Win_fence(0, sh_win);
++            shared_grid_sync(sh_win, node_comm);
          }
  
          /* Skip the particle integration during the first step */
-@@ -695,17 +775,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -695,17 +834,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
  
          /* Linearly interpolate the potentials to the current time step */
          double o = (log_tau - log_tau_major_prev) / (log_tau_major_next - log_tau_major_prev);
@@ -577,16 +736,16 @@ index c0c8a98..b958e20 100644
              box_phi_dot[i] = (box_phi1[i] - box_phi0[i]) * inv_delta_tau;
          }
  
-+        MPI_Win_fence(0, sh_win);
++        shared_grid_sync(sh_win, node_comm);
 +
          if (rank == 0 && ((pars->OutputFields > 1 && recompute) || (pars->OutputFields > 2 && ITER % 10 == 0))) {
              char psi_fname[50];
              sprintf(psi_fname, "%s/psi_%d.hdf5", pars->OutputDirectory, ITER);
-@@ -808,13 +890,15 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -808,13 +949,15 @@ long long run_fastdf(struct params *pars, struct units *us) {
              p->x[1] += p->v[1] * drift * dtau;
              p->x[2] += p->v[2] * drift * dtau;
          }
-+        MPI_Win_fence(0, sh_win);
++        shared_grid_sync(sh_win, node_comm);
  
          /* Linearly interpolate the potentials to the half-time step */
          double o2 = (log_tau_half - log_tau_major_prev) / (log_tau_major_next - log_tau_major_prev);
@@ -595,19 +754,19 @@ index c0c8a98..b958e20 100644
              box_phi[i] = o2 * box_phi1[i] + (1.0 - o2) * box_phi0[i];
              box_psi[i] = o2 * box_psi1[i] + (1.0 - o2) * box_psi0[i];
          }
-+        MPI_Win_fence(0, sh_win);
++        shared_grid_sync(sh_win, node_comm);
  
          /* Integrate the particles during the second half-step */
          #pragma omp parallel for
-@@ -883,6 +967,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -883,6 +1026,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
              p->v[1] += q_vec[1] * phi_dot_c2 * dtau2;
              p->v[2] += q_vec[2] * phi_dot_c2 * dtau2;
          }
-+        MPI_Win_fence(0, sh_win);
++        shared_grid_sync(sh_win, node_comm);
  
          /* Step forward */
          a = a_next;
-@@ -913,22 +998,11 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -913,22 +1057,11 @@ long long run_fastdf(struct params *pars, struct units *us) {
          }
      }
  
@@ -632,7 +791,7 @@ index c0c8a98..b958e20 100644
  
          header(verbosity_low, "Generating N-body gauge transformation grid");
  
-@@ -974,28 +1048,20 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -974,28 +1107,20 @@ long long run_fastdf(struct params *pars, struct units *us) {
              struct spline_params sp_Nbshift = {&spline, index_Nbshift, tau_index, u_tau};
              struct spline_params sp_HTNbp = {&spline, index_HTNbp, tau_index, u_tau};
  
@@ -667,7 +826,7 @@ index c0c8a98..b958e20 100644
  
              /* Compute the conformal time derivative of the background density */
              double Omega_nu = perturbDensityAtLogTau(&spline, log_tau_end, index_ncdm);
-@@ -1020,19 +1086,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -1020,19 +1145,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
              double rho_dot_rho_c4 = rho_dot_rho / (c * c * c * c);
  
              /* Compute the total density gauge shift */
@@ -686,18 +845,18 @@ index c0c8a98..b958e20 100644
 -            fft_normalize_c2r(box_dshift, N, BoxLen);
 -            fftw_destroy_plan(c2r);
 +            /* Fourier transform to real space (node_rank 0 only) */
-+            MPI_Win_fence(0, sh_win);
++            shared_grid_sync(sh_win, node_comm);
 +            if (node_rank == 0) {
 +                fftw_plan c2r = fftw_plan_dft_c2r_3d(N, N, N, fbox, box_dshift, FFTW_ESTIMATE);
 +                fft_execute(c2r);
 +                fft_normalize_c2r(box_dshift, N, BoxLen, 0, N);
 +                fftw_destroy_plan(c2r);
 +            }
-+            MPI_Win_fence(0, sh_win);
++            shared_grid_sync(sh_win, node_comm);
  
              if (rank == 0 && pars->OutputFields) {
                  char density_fname[50];
-@@ -1040,29 +1106,29 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -1040,29 +1165,29 @@ long long run_fastdf(struct params *pars, struct units *us) {
                  writeFieldFile(box_dshift, N, BoxLen, density_fname);
              }
  
@@ -720,14 +879,14 @@ index c0c8a98..b958e20 100644
 +            fft_apply_kernel(fbox_HTNbp, fbox_HTNbp, N, BoxLen, kernel_inv_poisson, NULL, x0, x1);
 +
 +            /* Fourier transform to real space (node_rank 0 only) */
-+            MPI_Win_fence(0, sh_win);
++            shared_grid_sync(sh_win, node_comm);
 +            if (node_rank == 0) {
 +                fftw_plan c2r3 = fftw_plan_dft_c2r_3d(N, N, N, fbox_HTNbp, box_tshift, FFTW_ESTIMATE);
 +                fft_execute(c2r3);
 +                fft_normalize_c2r(box_tshift, N, BoxLen, 0, N);
 +                fftw_destroy_plan(c2r3);
 +            }
-+            MPI_Win_fence(0, sh_win);
++            shared_grid_sync(sh_win, node_comm);
  
              if (rank == 0 && pars->OutputFields) {
                  char vshift_fname[50];
@@ -740,7 +899,7 @@ index c0c8a98..b958e20 100644
          }
  
          message(verbosity_low, "Applying N-body gauge transformation to the particles.\n");
-@@ -1097,15 +1163,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -1097,15 +1222,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
              p->v[2] += vel[2] * inv_c * eps_eV * a_end;
          }
  

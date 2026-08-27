@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 3.11)
+# Allow linking libraries to the fastdf_static target even though it is defined
+# in the (separate) FastDF subdirectory.
+if(POLICY CMP0079)
+    cmake_policy(SET CMP0079 NEW)
+endif()
 include(FetchContent)
 FetchContent_Declare(
     fastdf
@@ -107,5 +112,18 @@ if(NOT fastdf_POPULATED)
     endif()
 
     add_subdirectory(${fastdf_SOURCE_DIR} ${fastdf_BINARY_DIR})
+
+    # FastDF always uses the double-precision FFTW. Link it explicitly (rather
+    # than relying on the host executable's transitive link) so that the
+    # shared-memory path's fftw_init_threads()/fftw_plan_with_nthreads() calls
+    # resolve at link time. If the double-precision threads library is not
+    # available, USE_FFTW_THREADS is left undefined and FastDF gracefully falls
+    # back to a single FFT thread (the threaded calls are compiled out).
+    target_link_libraries(fastdf_static PUBLIC FFTW3::FFTW3_DOUBLE_SERIAL)
+    if(FFTW3_DOUBLE_THREADS_FOUND)
+        target_link_libraries(fastdf_static PUBLIC FFTW3::FFTW3_DOUBLE_THREADS)
+        target_compile_definitions(fastdf_static PRIVATE USE_FFTW_THREADS)
+    endif()
+
     set(WITH_CLASS 0)
 endif()
