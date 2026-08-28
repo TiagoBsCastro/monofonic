@@ -267,10 +267,10 @@ index 7bdd627..24b4d28 100644
  int fileExists(const char *fname) {
      int exists = 0;
 diff --git a/src/runner.c b/src/runner.c
-index c0c8a98..63e12fd 100644
+index c0c8a98..79389de 100644
 --- a/src/runner.c
 +++ b/src/runner.c
-@@ -24,9 +24,25 @@
+@@ -24,9 +24,29 @@
  #include <assert.h>
  #include <math.h>
  #include <sys/time.h>
@@ -280,14 +280,18 @@ index c0c8a98..63e12fd 100644
  
  #include "../include/fastdf.h"
  
-+/* Synchronize shared-memory access to the grid window. The grids are accessed
-+ * with ordinary C loads/stores (not MPI RMA). MPI_Win_fence synchronizes all
-+ * node-local ranks and establishes the exposure epoch that makes those
-+ * loads/stores visible. The lighter MPI_Win_sync + MPI_Barrier pair cannot be
-+ * used here: MPI_Win_sync requires an active RMA exposure epoch and fails with
-+ * MPI_ERR_RMA_SYNC ("Wrong synchronization of RMA calls") when called without
-+ * one (observed on MPICH). Correctness therefore takes priority over reducing
-+ * synchronization overhead, so we keep MPI_Win_fence. */
++/* Synchronize shared-memory access to the grid window.
++ *
++ * Shared grids are accessed through ordinary load/store operations.
++ *
++ * MPI_Win_sync + a node-local barrier is conceptually suitable for this usage
++ * under the unified memory model. However, the tested MPICH configuration
++ * returned MPI_ERR_RMA_SYNC for that implementation path.
++ *
++ * We therefore retain MPI_Win_fence here because it provides the required
++ * synchronization semantics on the MPI implementations tested for monofonIC.
++ * This is an implementation/portability choice rather than a requirement that
++ * MPI_Win_sync always needs an active exposure epoch. */
 +static inline void shared_grid_sync(MPI_Win win, MPI_Comm comm) {
 +    (void)comm;
 +    MPI_Win_fence(0, win);
@@ -296,7 +300,7 @@ index c0c8a98..63e12fd 100644
  // Returns the number of local particles generated
  long long run_fastdf(struct params *pars, struct units *us) {
      
-@@ -38,6 +54,31 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -38,6 +58,31 @@ long long run_fastdf(struct params *pars, struct units *us) {
      MPI_Comm_rank(MPI_COMM_WORLD, &rank);
      MPI_Comm_size(MPI_COMM_WORLD, &MPI_Rank_Count);
  
@@ -328,7 +332,7 @@ index c0c8a98..63e12fd 100644
      /* The level of verbosity */
      const int verbosity = pars->Verbosity;
      const int verbosity_low = rank + (verbosity == 0); // low priority
-@@ -185,7 +226,9 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -185,7 +230,9 @@ long long run_fastdf(struct params *pars, struct units *us) {
          message(verbosity_low, "\n\n");
      }
  
@@ -339,27 +343,30 @@ index c0c8a98..63e12fd 100644
      double *box;
      double BoxLen = 0;
      int N;
-@@ -193,9 +236,104 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -193,9 +240,142 @@ long long run_fastdf(struct params *pars, struct units *us) {
      header(verbosity_low, "Random phases");
      message(verbosity_low, "Reading Gaussian random field from %s (dataset %s).\n", pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset);
  
 -    readFieldFileDataSet(&box, &N, &BoxLen, pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset);
 -    // readFieldFile(&box, &N, &BoxLen, pars->GaussianRandomFieldFile);
 -    // readFieldFile_MPI(&box, &N, &BoxLen, MPI_COMM_WORLD, pars->GaussianRandomFieldFile);
-+    /* Read the grid size + box length on node_rank 0, then broadcast the I/O
-+     * status before the values so every node rank observes a failure
-+     * consistently (and never uses an uninitialized N to size the window). */
++    /* Read the grid size + box length on node_rank 0, then synchronize the I/O
++     * status first within the node and then across the whole job. Each node
++     * reads the white-noise file independently, so a failure on one node must
++     * make every rank exit consistently (never using an uninitialized N). */
 +    int io_status = 0;
++    int global_status = 0;
 +    if (node_rank == 0)
 +        io_status = readFieldHeader(&N, &BoxLen, pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset);
 +    MPI_Bcast(&io_status, 1, MPI_INT, 0, node_comm);
-+    if (io_status != 0) {
++    MPI_Allreduce(&io_status, &global_status, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
++    if (global_status != 0) {
 +        printf("Error: could not read the white-noise header (status %d).\n", io_status);
 +        MPI_Comm_free(&node_comm);
 +        cleanPerturb(&ptdat);
 +        cleanPerturbParams(&ptpars);
 +        cleanPerturbSpline(&spline);
-+        return 1;
++        return -1;
 +    }
 +    MPI_Bcast(&N, 1, MPI_INT, 0, node_comm);
 +    MPI_Bcast(&BoxLen, 1, MPI_DOUBLE, 0, node_comm);
@@ -384,9 +391,30 @@ index c0c8a98..63e12fd 100644
 +    void *sh_base = NULL;
 +    MPI_Win sh_win;
 +    MPI_Aint local_sz = (node_rank == 0) ? (MPI_Aint)total_sz : 0;
-+    MPI_Win_allocate_shared(local_sz, sizeof(double), MPI_INFO_NULL, node_comm, &sh_base, &sh_win);
++    int mpi_status = MPI_Win_allocate_shared(local_sz, sizeof(double), MPI_INFO_NULL, node_comm, &sh_base, &sh_win);
++    MPI_Allreduce(&mpi_status, &global_status, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
++    if (global_status != MPI_SUCCESS) {
++        /* The window may not be valid on the ranks where allocation failed, so
++         * do not attempt to free it here. */
++        printf("Error: MPI_Win_allocate_shared failed (status %d).\n", mpi_status);
++        MPI_Comm_free(&node_comm);
++        cleanPerturb(&ptdat);
++        cleanPerturbParams(&ptpars);
++        cleanPerturbSpline(&spline);
++        return -1;
++    }
 +    MPI_Aint sh_size; int sh_disp;
-+    MPI_Win_shared_query(sh_win, 0, &sh_size, &sh_disp, &sh_base);
++    mpi_status = MPI_Win_shared_query(sh_win, 0, &sh_size, &sh_disp, &sh_base);
++    MPI_Allreduce(&mpi_status, &global_status, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
++    if (global_status != MPI_SUCCESS) {
++        printf("Error: MPI_Win_shared_query failed (status %d).\n", mpi_status);
++        MPI_Win_free(&sh_win);
++        MPI_Comm_free(&node_comm);
++        cleanPerturb(&ptdat);
++        cleanPerturbParams(&ptpars);
++        cleanPerturbSpline(&spline);
++        return -1;
++    }
 +
 +    /* Fixed grids (alive throughout) */
 +    char *shb = (char *)sh_base;
@@ -423,19 +451,33 @@ index c0c8a98..63e12fd 100644
 +    fftw_complex *fbox_alpha   = (fftw_complex *)(scr + 8 * real_stride);
 +    fftw_complex *fbox_HTNbp   = (fftw_complex *)(scr + 2 * real_stride);
 +
++    /* Debug-only: every carved grid must lie within the shared window. The
++     * highest-end grid is fbox_alpha (ends at 9*real_stride + 3*cplx_sz). */
++    assert((char *)fbox + cplx_sz <= shb + total_sz);
++    assert((char *)fgrf + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_phi + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_psi + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_hdot + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_etadot + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_Nbshift + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_alpha + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_HTNbp + cplx_sz <= shb + total_sz);
++
 +    /* node_rank 0 reads the white-noise field into the shared window; the status
-+     * is broadcast so every node rank observes a failure consistently. */
++     * is broadcast node-wide and then reduced job-wide so a failure on any node
++     * makes every rank exit consistently. */
 +    if (node_rank == 0)
 +        io_status = readFieldBody(box, pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset, N);
 +    MPI_Bcast(&io_status, 1, MPI_INT, 0, node_comm);
-+    if (io_status != 0) {
++    MPI_Allreduce(&io_status, &global_status, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
++    if (global_status != 0) {
 +        printf("Error: could not read the white-noise field (status %d).\n", io_status);
 +        MPI_Win_free(&sh_win);
 +        MPI_Comm_free(&node_comm);
 +        cleanPerturb(&ptdat);
 +        cleanPerturbParams(&ptpars);
 +        cleanPerturbSpline(&spline);
-+        return 1;
++        return -1;
 +    }
 +    shared_grid_sync(sh_win, node_comm);
 +
@@ -447,7 +489,7 @@ index c0c8a98..63e12fd 100644
  
      /* Override the box length? */
      if (BoxLen > 0.) {
-@@ -219,65 +357,74 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -219,65 +399,74 @@ long long run_fastdf(struct params *pars, struct units *us) {
          exit(1);
      }
  
@@ -567,7 +609,7 @@ index c0c8a98..63e12fd 100644
  
      /* Do we need to apply the primordial power spectrum? */
      if (pars->NormalizeGaussianField || pars->AssumeMonofonicNormalization) {
-@@ -296,11 +443,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -296,11 +485,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
          message(verbosity_low, "beta_s = %.5g\n", ps.beta_s);
  
          /* Apply the bare power spectrum to fbox */
@@ -583,7 +625,7 @@ index c0c8a98..63e12fd 100644
  
      /* Find the relevant density title among the transfer functions */
      char *title = pars->TransferFunctionDensity;
-@@ -382,10 +530,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -382,10 +572,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
      double z_begin = 1./a_begin - 1;
      double log_tau_begin = perturbLogTauAtRedshift(&spline, z_begin);
  
@@ -595,7 +637,7 @@ index c0c8a98..63e12fd 100644
  
      header(verbosity_low, "Generating pre-initial conditions");
      message(verbosity_low, "Generating pre-initial grids.\n");
-@@ -407,24 +552,31 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -407,24 +594,38 @@ long long run_fastdf(struct params *pars, struct units *us) {
          struct spline_params sp = {&spline, index_psi, tau_index, u_tau};
  
          /* Apply the transfer function (read only fgrf, output into fbox) */
@@ -618,15 +660,23 @@ index c0c8a98..63e12fd 100644
 -        fftw_destroy_plan(c2r);
 +        fft_normalize_c2r(box, N, BoxLen, x0, x1);
  
-         /* Copy into the boxes for the density and velocity perturbations */
+-        /* Copy into the boxes for the density and velocity perturbations */
 -        memcpy(box_dic, box, N*N*N*sizeof(double));
 -        memcpy(box_tic, box, N*N*N*sizeof(double));
-+        memcpy(box_dic + i0, box + i0, (i1 - i0) * sizeof(double));
-+        memcpy(box_tic + i0, box + i0, (i1 - i0) * sizeof(double));
++        /* Copy into the boxes for the density and velocity perturbations.
++         * Use the same x-slice decomposition as fft_normalize_c2r above (flat
++         * range j0..j1 == x-slice x0..x1) so that each rank copies exactly the
++         * x-planes it normalized. Using a separate flat i0..i1 split would be
++         * inconsistent with the x-slice when node_size > N and would let a rank
++         * read x-planes normalized by another rank without synchronization. */
++        const size_t j0 = (size_t)x0 * N * N;
++        const size_t j1 = (size_t)x1 * N * N;
++        memcpy(box_dic + j0, box + j0, (j1 - j0) * sizeof(double));
++        memcpy(box_tic + j0, box + j0, (j1 - j0) * sizeof(double));
  
          /* Multiply by the appropriate factor */
 -        for (int i=0; i<N*N*N; i++) {
-+        for (size_t i = i0; i < i1; i++) {
++        for (size_t i = j0; i < j1; i++) {
              box_dic[i] *= -2 * inv_c2;
              box_tic[i] *= 0.5 * exp(log_tau_begin);
          }
@@ -636,7 +686,7 @@ index c0c8a98..63e12fd 100644
          if (rank == 0 && pars->OutputFields) {
              char dnu_fname[50];
              sprintf(dnu_fname, "%s/ic_dnu.hdf5", pars->OutputDirectory);
-@@ -490,9 +642,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -490,9 +691,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
          p->v_i_mag = hypot3(p->v[0], p->v[1], p->v[2]);
      }
  
@@ -647,7 +697,7 @@ index c0c8a98..63e12fd 100644
  
      message(verbosity_low, "Done with pre-initial conditions.\n");
  
-@@ -524,23 +674,8 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -524,23 +723,8 @@ long long run_fastdf(struct params *pars, struct units *us) {
  
      message(verbosity_high, "     ITER a         z         I            recompute\n");
  
@@ -673,7 +723,7 @@ index c0c8a98..63e12fd 100644
  
      /* Transer functions evaluated at a reference scale during the last update */
      double Tk_phi = 0.0;
-@@ -662,7 +797,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -662,7 +846,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
              Tk_psi = Tk_psi_curr;
  
              /* Copy the current boxes at t=t1 to the slots for t=t0 */
@@ -682,7 +732,7 @@ index c0c8a98..63e12fd 100644
                  memcpy(box_phi0, box_phi1, N*N*N*sizeof(double));
                  memcpy(box_psi0, box_psi1, N*N*N*sizeof(double));
              }
-@@ -674,19 +809,23 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -674,19 +858,23 @@ long long run_fastdf(struct params *pars, struct units *us) {
              struct spline_params sp_psi_curr = {&spline, index_psi, tau_idx_major_next, u_major_next};
  
              /* Apply the transfer function (read only fgrf, output into fbox) */
@@ -719,7 +769,7 @@ index c0c8a98..63e12fd 100644
          }
  
          /* Skip the particle integration during the first step */
-@@ -695,17 +834,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -695,17 +883,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
  
          /* Linearly interpolate the potentials to the current time step */
          double o = (log_tau - log_tau_major_prev) / (log_tau_major_next - log_tau_major_prev);
@@ -741,7 +791,7 @@ index c0c8a98..63e12fd 100644
          if (rank == 0 && ((pars->OutputFields > 1 && recompute) || (pars->OutputFields > 2 && ITER % 10 == 0))) {
              char psi_fname[50];
              sprintf(psi_fname, "%s/psi_%d.hdf5", pars->OutputDirectory, ITER);
-@@ -808,13 +949,15 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -808,13 +998,15 @@ long long run_fastdf(struct params *pars, struct units *us) {
              p->x[1] += p->v[1] * drift * dtau;
              p->x[2] += p->v[2] * drift * dtau;
          }
@@ -758,7 +808,7 @@ index c0c8a98..63e12fd 100644
  
          /* Integrate the particles during the second half-step */
          #pragma omp parallel for
-@@ -883,6 +1026,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -883,6 +1075,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
              p->v[1] += q_vec[1] * phi_dot_c2 * dtau2;
              p->v[2] += q_vec[2] * phi_dot_c2 * dtau2;
          }
@@ -766,7 +816,7 @@ index c0c8a98..63e12fd 100644
  
          /* Step forward */
          a = a_next;
-@@ -913,22 +1057,11 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -913,22 +1106,11 @@ long long run_fastdf(struct params *pars, struct units *us) {
          }
      }
  
@@ -791,7 +841,7 @@ index c0c8a98..63e12fd 100644
  
          header(verbosity_low, "Generating N-body gauge transformation grid");
  
-@@ -974,28 +1107,20 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -974,28 +1156,20 @@ long long run_fastdf(struct params *pars, struct units *us) {
              struct spline_params sp_Nbshift = {&spline, index_Nbshift, tau_index, u_tau};
              struct spline_params sp_HTNbp = {&spline, index_HTNbp, tau_index, u_tau};
  
@@ -826,7 +876,7 @@ index c0c8a98..63e12fd 100644
  
              /* Compute the conformal time derivative of the background density */
              double Omega_nu = perturbDensityAtLogTau(&spline, log_tau_end, index_ncdm);
-@@ -1020,19 +1145,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -1020,19 +1194,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
              double rho_dot_rho_c4 = rho_dot_rho / (c * c * c * c);
  
              /* Compute the total density gauge shift */
@@ -856,7 +906,7 @@ index c0c8a98..63e12fd 100644
  
              if (rank == 0 && pars->OutputFields) {
                  char density_fname[50];
-@@ -1040,29 +1165,29 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -1040,29 +1214,29 @@ long long run_fastdf(struct params *pars, struct units *us) {
                  writeFieldFile(box_dshift, N, BoxLen, density_fname);
              }
  
@@ -899,7 +949,7 @@ index c0c8a98..63e12fd 100644
          }
  
          message(verbosity_low, "Applying N-body gauge transformation to the particles.\n");
-@@ -1097,15 +1222,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
+@@ -1097,15 +1271,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
              p->v[2] += vel[2] * inv_c * eps_eV * a_end;
          }
  
