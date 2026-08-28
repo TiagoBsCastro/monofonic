@@ -1,11 +1,11 @@
 /* End-to-end check that a FastDF white-noise input failure is reported as a
  * negative return value (which monofonIC's ic_generator.cc turns into a thrown
- * std::runtime_error).  run_fastdf() must return < 0, and with several MPI
+ * std::runtime_error). run_fastdf() must return < 0, and with several MPI
  * ranks every rank must reach the same failure without deadlocking.
  *
- * Build against the FastDF + CLASS + FFTW + GSL + HDF5 libraries (see
- * run_tests.sh for the exact link line).  Requires input_class_parameters.ini
- * (produced by a prior monofonIC run) in the working directory.
+ * The path to a valid input_class_parameters.ini is passed as argv[1]. The
+ * white-noise file is then deliberately set to a missing path so the test
+ * exercises FastDF's white-noise failure path rather than failing in CLASS.
  */
 #include <stdio.h>
 #include <string.h>
@@ -19,6 +19,13 @@ int main(int argc, char **argv) {
 
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    if (argc != 2) {
+        if (rank == 0)
+            fprintf(stderr, "usage: test_fastdf_failure /path/to/input_class_parameters.ini\n");
+        MPI_Finalize();
+        return 2;
+    }
 
     struct params pars;
     struct units us;
@@ -55,12 +62,11 @@ int main(int argc, char **argv) {
     strcpy(pars.OutputDirectory, ".");
     strcpy(pars.ExportName, "PartType2");
     strcpy(pars.OutputFilename, "ics_failtest.hdf5");
-    /* Deliberately point FastDF at a white-noise file that does not exist. */
     strcpy(pars.GaussianRandomFieldFile, "missing_white_noise.hdf5");
     strcpy(pars.GaussianRandomFieldDataset, "white_noise");
     strcpy(pars.TransferFunctionDensity, "d_ncdm[0]");
     strcpy(pars.Gauge, "Newtonian");
-    strcpy(pars.ClassIniFile, "input_class_parameters.ini");
+    snprintf(pars.ClassIniFile, DEFAULT_STRING_LENGTH, "%s", argv[1]);
     strcpy(pars.VelocityType, "Gadget");
 
     long long result = run_fastdf(&pars, &us);
@@ -74,9 +80,12 @@ int main(int argc, char **argv) {
     MPI_Finalize();
 
     if (global_ok) {
-        if (rank == 0) printf("PASS: failure reported as negative on all ranks\n");
+        if (rank == 0)
+            printf("PASS: failure reported as negative on all ranks\n");
         return 0;
     }
-    if (rank == 0) printf("FAIL: expected negative return (got %lld)\n", result);
+
+    if (rank == 0)
+        printf("FAIL: expected negative return (got %lld)\n", result);
     return 1;
 }

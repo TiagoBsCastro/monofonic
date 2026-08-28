@@ -78,6 +78,35 @@ if(NOT fastdf_POPULATED)
         endif()
     endif()
 
+    # Final shared-window cleanup/error-handling fixes are kept separate from the
+    # main implementation patch so this focused hardening pass stays reviewable.
+    set(FASTDF_SHARED_HARDENING_PATCH "${CMAKE_CURRENT_LIST_DIR}/fastdf-shared-final-hardening.patch")
+    execute_process(
+        COMMAND git apply --check "${FASTDF_SHARED_HARDENING_PATCH}"
+        WORKING_DIRECTORY "${fastdf_SOURCE_DIR}"
+        RESULT_VARIABLE FASTDF_HARDENING_PATCH_CHECK
+        OUTPUT_QUIET
+        ERROR_QUIET)
+    if(FASTDF_HARDENING_PATCH_CHECK EQUAL 0)
+        execute_process(
+            COMMAND git apply "${FASTDF_SHARED_HARDENING_PATCH}"
+            WORKING_DIRECTORY "${fastdf_SOURCE_DIR}"
+            RESULT_VARIABLE FASTDF_HARDENING_PATCH_RESULT)
+        if(NOT FASTDF_HARDENING_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR "Failed to apply the FastDF shared-window hardening patch")
+        endif()
+    else()
+        execute_process(
+            COMMAND git apply --reverse --check "${FASTDF_SHARED_HARDENING_PATCH}"
+            WORKING_DIRECTORY "${fastdf_SOURCE_DIR}"
+            RESULT_VARIABLE FASTDF_HARDENING_PATCH_REVERSE_CHECK
+            OUTPUT_QUIET
+            ERROR_QUIET)
+        if(NOT FASTDF_HARDENING_PATCH_REVERSE_CHECK EQUAL 0)
+            message(FATAL_ERROR "FastDF source does not match the pinned shared-window hardening patch")
+        endif()
+    endif()
+
     # FastDF uses a fixed HDF5 chunk length of 65536.  HDF5 rejects that
     # layout when generating fewer particles (including the required 32^3
     # smoke case), while FastDF does not check the H5Dcreate return value.

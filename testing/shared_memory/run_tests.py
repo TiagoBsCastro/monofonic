@@ -1,33 +1,25 @@
 #!/usr/bin/env python3
 """Regression tests for the per-node shared-memory FastDF window.
 
-Usage:  run_tests.py /path/to/monofonIC [mpirun]
-
-Exercises:
-  * serial (1 rank), mpi4 (4 ranks), mpi9 (9 ranks > 8 x-planes), hybrid (2x2)
-  * NeutrinoGridRes < GridRes  and  NeutrinoGridRes == GridRes
-  * DoInversion = no  and  DoInversion = yes
-  * white-noise HDF5 failure handling (missing file/dataset, malformed dims)
-  * end-to-end FastDF failure (run_fastdf() < 0, no deadlock in MPI)
-
-For each (grid, inversion) case the full particle realization is reconstructed
-from the per-rank output files (concatenate + sort by ParticleID) and compared
-across execution layouts.  Comparisons cover IDs, Coordinates, Velocities and
-PhaseSpaceDensities, reporting max absolute/relative differences.
+Usage:
+  run_tests.py /path/to/branch/monofonIC /path/to/master/monofonIC \
+      [--mpirun mpirun] [--class-ini-out /path/to/input_class_parameters.ini]
 """
 
-import os
-
-import sys
+import argparse
 import glob
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import h5py
 import numpy as np
 
 M3 = 8 ** 3  # NeutrinoCubeRootNum^3
+REL_TOL = 1e-10
+MASTER_REL_TOL = 1e-12
 
 
 def make_config(path, grid_res, nu_res, invert, threads, filename):
@@ -74,74 +66,89 @@ def load_realization(pattern):
     files = sorted(glob.glob(pattern))
     files = [f for f in files if ".fastdf-tmp." not in f]
     assert files, f"no output files match {pattern}"
-    ids = c = v = psd = None
-    for f in files:
-        with h5py.File(f, "r") as h:
-            g = h["PartType2"]
-            fi = np.asarray(g["ParticleIDs"][:])
-            fc = np.asarray(g["Coordinates"][:])
-            fv = np.asarray(g["Velocities"][:])
-            fp = np.asarray(g["PhaseSpaceDensities"][:])
-        ids = fi if ids is None else np.concatenate([ids, fi])
-        c = fc if c is None else np.concatenate([c, fc])
-        v = fv if v is None else np.concatenate([v, fv])
-        psd = fp if psd is None else np.concatenate([psd, fp])
-    o = np.argsort(ids)
-    return ids[o], c[o], v[o], psd[o]
+
+    ids_parts, coord_parts, vel_parts, psd_parts = [], [], [], []
+    for filename in files:
+        with h5py.File(filename, "r") as h:
+            group = h["PartType2"]
+            ids_parts.append(np.asarray(group["ParticleIDs"][:]))
+            coord_parts.append(np.asarray(group["Coordinates"][:]))
+            vel_parts.append(np.asarray(group["Velocities"][:]))
+            psd_parts.append(np.asarray(group["PhaseSpaceDensities"][:]))
+
+    ids = np.concatenate(ids_parts)
+    coords = np.concatenate(coord_parts)
+    velocities = np.concatenate(vel_parts)
+    psd = np.concatenate(psd_parts)
+    order = np.argsort(ids)
+    return ids[order], coords[order], velocities[order], psd[order]
 
 
-# Relative tolerance for cross-layout floating-point comparisons.
-#
-# The FastDF shared-memory code is bit-identical for a fixed input (and the same
-# execution layout).  However, monofonIC's white-noise field is generated with a
-# distributed/threaded FFT whose reduction order depends on the MPI layout, so
-# the *input* to FastDF differs at the ~1e-16 level between layouts.  This tiny
-# input difference is amplified to ~1e-15 relative in the particle output.  The
-# tolerance below is ~1e5 larger than that amplification and ~1e9 smaller than
-# the empty-slice bug it guards against (relative error ~0.98), so it is a tight
-# but robust criterion.
-REL_TOL = 1e-10
+def relative_error(a, b):
+    abs_diff = np.max(np.abs(a - b))
+    scale = max(float(np.max(np.abs(a))), float(np.max(np.abs(b))))
+    return abs_diff / scale if scale > 0.0 else abs_diff
 
 
 def float_report(name, a, b, ok):
     if np.array_equal(a, b):
         return f"{name}: bit-identical"
-    absd = np.max(np.abs(a - b))
-    denom = np.max(np.abs(b))
-    reld = absd / denom if denom > 0 else 0.0
+    abs_diff = np.max(np.abs(a - b))
+    rel_diff = relative_error(a, b)
     status = "OK" if ok else "FAIL"
-    return f"{name}: max|d|={absd:.3e} max rel={reld:.3e} [{status}]"
+    return f"{name}: max|d|={abs_diff:.3e} max rel={rel_diff:.3e} [{status}]"
 
 
-def compare(real_a, real_b):
-    ia, ca, va, pa = real_a
-    ib, cb, vb, pb = real_b
-    assert ia.shape == ib.shape, "particle count mismatch"
-    assert len(ia) == M3, f"expected {M3} particles, got {len(ia)}"
-    assert np.array_equal(ia, ib), "ParticleIDs differ"
+def compare(real_a, real_b, rel_tol):
+    ids_a, coords_a, velocities_a, psd_a = real_a
+    ids_b, coords_b, velocities_b, psd_b = real_b
 
-    def rel(a, b):
-        return np.max(np.abs(a - b)) / np.max(np.abs(b))
+    assert ids_a.shape == ids_b.shape, "particle count mismatch"
+    assert len(ids_a) == M3, f"expected {M3} particles, got {len(ids_a)}"
+    assert np.array_equal(ids_a, ids_b), "ParticleIDs differ"
 
-    ok_c = np.array_equal(ca, cb) or rel(ca, cb) < REL_TOL
-    ok_v = np.array_equal(va, vb) or rel(va, vb) < REL_TOL
-    ok_p = np.array_equal(pa, pb) or rel(pa, pb) < REL_TOL
+    ok_coords = np.array_equal(coords_a, coords_b) or relative_error(coords_a, coords_b) < rel_tol
+    ok_velocities = np.array_equal(velocities_a, velocities_b) or relative_error(velocities_a, velocities_b) < rel_tol
+    ok_psd = np.array_equal(psd_a, psd_b) or relative_error(psd_a, psd_b) < rel_tol
 
-    lines = [
-        f"  particle count: {len(ia)} (OK)",
+    report = "\n".join([
+        f"  particle count: {len(ids_a)} (OK)",
         "  IDs: bit-identical",
-        f"  {float_report('Coordinates', ca, cb, ok_c)}",
-        f"  {float_report('Velocities', va, vb, ok_v)}",
-        f"  {float_report('PhaseSpaceDensities', pa, pb, ok_p)}",
-    ]
-    assert ok_c and ok_v and ok_p, "floating-point mismatch exceeds tolerance"
-    return "\n".join(lines)
+        f"  {float_report('Coordinates', coords_a, coords_b, ok_coords)}",
+        f"  {float_report('Velocities', velocities_a, velocities_b, ok_velocities)}",
+        f"  {float_report('PhaseSpaceDensities', psd_a, psd_b, ok_psd)}",
+    ])
+    assert ok_coords and ok_velocities and ok_psd, "floating-point mismatch exceeds tolerance"
+    return report
+
+
+def run_case(binary, mpirun, workdir, grid_res, nu_res, invert, threads, np_rank, filename):
+    os.makedirs(workdir, exist_ok=True)
+    config = os.path.join(workdir, "run.conf")
+    make_config(config, grid_res, nu_res, invert, threads, filename)
+
+    env = dict(os.environ)
+    if threads > 1:
+        env["OMP_NUM_THREADS"] = str(threads)
+
+    command = [binary, "run.conf"] if np_rank == 1 else [mpirun, "-np", str(np_rank), binary, "run.conf"]
+    result = subprocess.run(command, cwd=workdir, env=env)
+    return result.returncode
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("branch_binary")
+    parser.add_argument("master_binary")
+    parser.add_argument("--mpirun", default="mpirun")
+    parser.add_argument("--class-ini-out")
+    return parser.parse_args()
 
 
 def main():
-    binary = os.path.abspath(sys.argv[1])
-    mpirun = sys.argv[2] if len(sys.argv) > 2 else "mpirun"
-    here = os.path.dirname(os.path.abspath(__file__))
+    args = parse_args()
+    branch_binary = os.path.abspath(args.branch_binary)
+    master_binary = os.path.abspath(args.master_binary)
     work = tempfile.mkdtemp(prefix="fastdf_shared_")
 
     layouts = [
@@ -150,7 +157,6 @@ def main():
         ("mpi9", 9, 1),
         ("hybrid", 2, 2),
     ]
-
     cases = [
         ("lt", 16, 8, False),
         ("eq", 8, 8, False),
@@ -158,40 +164,87 @@ def main():
     ]
 
     failures = 0
+    branch_serial_baseline = None
+    class_ini_copied = False
+
     try:
         for case, grid_res, nu_res, invert in cases:
-            reals = {}
+            realizations = {}
             for name, np_rank, threads in layouts:
-                # hybrid only exercised on the baseline (lt, no inversion)
                 if name == "hybrid" and case != "lt":
                     continue
-                sub = os.path.join(work, f"{case}_{name}")
-                os.makedirs(sub, exist_ok=True)
-                cfg = os.path.join(sub, "run.conf")
-                make_config(cfg, grid_res, nu_res, invert, threads, f"ics_{name}.hdf5")
-                env = dict(os.environ)
-                if threads > 1:
-                    env["OMP_NUM_THREADS"] = str(threads)
-                cmd = [binary, "run.conf"] if np_rank == 1 else [mpirun, "-np", str(np_rank), binary, "run.conf"]
+
+                subdir = os.path.join(work, f"{case}_{name}")
                 print(f"=== {case}/{name} (np={np_rank}, threads={threads}) ===", flush=True)
-                r = subprocess.run(cmd, cwd=sub, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if r.returncode != 0:
-                    print(f"  FAILED (exit {r.returncode})")
+                rc = run_case(
+                    branch_binary, args.mpirun, subdir, grid_res, nu_res,
+                    invert, threads, np_rank, f"ics_{name}.hdf5"
+                )
+                if rc != 0:
+                    print(f"  FAILED (exit {rc})")
                     failures += 1
                     continue
-                reals[name] = load_realization(os.path.join(sub, f"ics_{name}*.hdf5"))
+
+                try:
+                    realizations[name] = load_realization(os.path.join(subdir, f"ics_{name}*.hdf5"))
+                except Exception as exc:
+                    print(f"  FAILED while reading output: {exc}")
+                    failures += 1
+                    continue
                 print("  OK")
-            # compare every layout against serial within this case
-            if "serial" not in reals:
+
+                if case == "lt" and name == "serial":
+                    branch_serial_baseline = realizations[name]
+                    if args.class_ini_out:
+                        generated_ini = os.path.join(subdir, "input_class_parameters.ini")
+                        if not os.path.isfile(generated_ini):
+                            print(f"  FAILED: expected generated CLASS input {generated_ini}")
+                            failures += 1
+                        else:
+                            output_dir = os.path.dirname(os.path.abspath(args.class_ini_out))
+                            os.makedirs(output_dir, exist_ok=True)
+                            shutil.copy2(generated_ini, args.class_ini_out)
+                            class_ini_copied = True
+
+            if "serial" not in realizations:
                 continue
-            base = reals["serial"]
-            for name in ["mpi4", "mpi9", "hybrid"]:
-                if name not in reals:
+            baseline = realizations["serial"]
+            for name in ("mpi4", "mpi9", "hybrid"):
+                if name not in realizations:
                     continue
                 print(f"  serial vs {name}:")
-                print(compare(base, reals[name]))
-        print(f"\n{'ALL LAYOUT COMPARISONS PASSED' if failures == 0 else 'FAILURES DETECTED'}")
-        return failures
+                try:
+                    print(compare(baseline, realizations[name], REL_TOL))
+                except AssertionError as exc:
+                    print(f"  FAIL: {exc}")
+                    failures += 1
+
+        print("\n=== master vs branch serial baseline ===", flush=True)
+        master_dir = os.path.join(work, "master_serial")
+        rc = run_case(
+            master_binary, args.mpirun, master_dir,
+            16, 8, False, 1, 1, "ics_master.hdf5"
+        )
+        if rc != 0:
+            print(f"  FAILED master run (exit {rc})")
+            failures += 1
+        elif branch_serial_baseline is None:
+            print("  FAILED: branch serial baseline unavailable")
+            failures += 1
+        else:
+            try:
+                master_realization = load_realization(os.path.join(master_dir, "ics_master*.hdf5"))
+                print(compare(master_realization, branch_serial_baseline, MASTER_REL_TOL))
+            except (AssertionError, Exception) as exc:
+                print(f"  FAIL: {exc}")
+                failures += 1
+
+        if args.class_ini_out and not class_ini_copied:
+            print("FAILED: CLASS input was not produced for the end-to-end failure test")
+            failures += 1
+
+        print(f"\n{'ALL LAYOUT AND MASTER COMPARISONS PASSED' if failures == 0 else 'FAILURES DETECTED'}")
+        return 0 if failures == 0 else 1
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
