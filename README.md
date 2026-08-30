@@ -1,11 +1,23 @@
 # MUSIC2 - monofonIC
+
 Modular high-precision IC generator for cosmological simulations. MUSIC2-monofonIC is for non-zoom full box ICs (use [MUSIC](https://bitbucket.org/ohahn/music) for zooms, MUSIC2 for zooms is in the works).
+
+## About this fork
+
+This fork was created to integrate monofonIC more closely with OpenGadget3. In
+addition to the stand-alone executable, it provides an embeddable
+`monofonic_core` library and an in-memory particle interface. OpenGadget3 can
+therefore generate initial conditions on the fly during startup, without first
+writing and then reading intermediate particle files.
+
+The stand-alone monofonIC workflow remains available as the reference
+implementation and for generating conventional IC files.
 
 Note that this program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY.
 
 BEWARE: This software package is currently in a beta testing phase! Proceed with caution before using it for large-scale simulations.
 
-[The full manual is available here as a wiki](https://bitbucket.org/ohahn/monofonic/wiki/). Quick instructions can be found below.
+[The upstream manual is available here as a wiki](https://bitbucket.org/ohahn/monofonic/wiki/). Quick instructions can be found below.
 
 Currently supported features (the list is growing, so check back):
 
@@ -18,6 +30,8 @@ Currently supported features (the list is growing, so check back):
 - Multiple Einstein-Boltzmann modules: direct interface with [CLASS](https://lesgourg.github.io/class_public/class.html), file input from CAMB, and fitting formulae (Eisenstein&Hu).
 
 - Multiple output modules for RAMSES, Arepo, Gadget-2/3, SWIFT, and HACC (courtesy M.Buehlmann) via plugins (Nyx is next).
+
+- Embeddable OpenGadget3 integration for generating and transferring initial conditions in memory at runtime.
 
 - Multiple random number modules (MUSIC1,NGenIC,Panphasia,...) (A new MUSIC2 module is in development)
 
@@ -54,10 +68,11 @@ We acknowledge support from the European Research Council (ERC) under the Europe
 
 
 ## Build Instructions
-Clone code including submodules (currently only CLASS is used as a submodule):
+
+Clone this fork:
 
 ```
-  git clone https://<username>@bitbucket.org/ohahn/monofonic.git
+  git clone https://github.com/TiagoBsCastro/monofonic.git
 ```
 
 Create build directory, configure, and build:
