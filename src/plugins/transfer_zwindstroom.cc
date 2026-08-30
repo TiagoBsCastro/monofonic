@@ -20,10 +20,26 @@
 #ifdef USE_CLASS
 
 #include <cmath>
+#include <cfloat>
+#include <array>
+#include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 #include <zwindstroom.h>
 #include <ClassEngine.hh>
@@ -52,20 +68,67 @@ private:
   double Dm_asymptotic_, fm_asymptotic_, fcb_asymptotic_, vfac_asymptotic_;
 
   ClassParams pars_;
-  std::unique_ptr<ClassEngine> the_ClassEngine_; //synchronous gauge
-  std::unique_ptr<ClassEngine> the_ClassEngine_Nbody_; //N-body gauge
-  std::ofstream ofs_class_input_;
+  std::ostream *class_input_output_ = nullptr;
+
+  enum class_sample { sample_z0 = 0, sample_ztarget = 1, sample_zstart = 2, sample_zminus = 3, sample_zplus = 4 };
+  enum transfer_column { column_dc = 0, column_tc = 1, column_db = 2, column_tb = 3,
+                         column_dn = 4, column_tn = 5, column_dm = 6, column_tm = 7 };
+
+  struct class_tables
+  {
+    double A_s = 0.0;
+    std::vector<double> k;
+    std::array<std::array<std::vector<double>, 8>, 5> transfer;
+  };
+
+  class omp_team_guard
+  {
+  public:
+    explicit omp_team_guard(int threads)
+    {
+#if defined(_OPENMP)
+      dynamic_ = omp_get_dynamic();
+      threads_ = omp_get_max_threads();
+      omp_set_dynamic(0);
+      omp_set_num_threads(threads);
+#else
+      _unused(threads);
+#endif
+    }
+    ~omp_team_guard()
+    {
+#if defined(_OPENMP)
+      omp_set_num_threads(threads_);
+      omp_set_dynamic(dynamic_);
+#endif
+    }
+  private:
+#if defined(_OPENMP)
+    int dynamic_ = 0;
+    int threads_ = 1;
+#endif
+  };
 
   template <typename T>
   void add_class_parameter(std::string parameter_name, const T parameter_value)
   {
     pars_.add(parameter_name, parameter_value);
-    ofs_class_input_ << parameter_name << " = " << parameter_value << std::endl;
+    if (class_input_output_ != nullptr)
+      *class_input_output_ << parameter_name << " = " << parameter_value << std::endl;
   }
 
   //! Set up class parameters from MUSIC cosmological parameters
-  void init_ClassEngine(void)
+  void prepare_ClassParameters(bool write_control_file)
   {
+
+    pars_ = ClassParams();
+    std::ofstream class_input;
+    if (write_control_file) {
+      class_input.open("input_class_parameters.ini", std::ios::trunc);
+      if (!class_input)
+        throw std::runtime_error("Could not write input_class_parameters.ini");
+      class_input_output_ = &class_input;
+    }
 
     //--- general parameters ------------------------------------------
     add_class_parameter("z_max_pk", 1e10); // start very early to allow integrating neutrinos
@@ -170,74 +233,218 @@ private:
       zlist << std::max(ztarget_, zstart_) << ", " << std::min(ztarget_, zstart_) << ", 0.0";
     add_class_parameter("z_pk", zlist.str());
 
-    music::ilog << "Computing transfer function via ClassEngine... (synchronous gauge)" << std::endl;
-    double wtime = get_wtime();
-
-    the_ClassEngine_ = std::move(std::make_unique<ClassEngine>(pars_, false));
-
-    music::ilog << "Computing transfer function via ClassEngine... (N-body gauge)" << std::endl;
-
-    // do the calculation again, but now exporting N-body gauge transfer functions
-    add_class_parameter("nbody_gauge_transfer_functions", "yes");
-    the_ClassEngine_Nbody_ = std::move(std::make_unique<ClassEngine>(pars_, false));
-
-    wtime = get_wtime() - wtime;
-    music::ilog << "CLASS took " << wtime << " s." << std::endl;
+    // This is an informational control file, so include the option used by
+    // the second, N-body-gauge solve without modifying the synchronous input.
+    if (class_input_output_ != nullptr)
+      *class_input_output_ << "nbody_gauge_transfer_functions = yes" << std::endl;
+    class_input_output_ = nullptr;
+    class_input.close();
   }
 
-  //! run ClassEngine with parameters set up
-  void run_ClassEngine(double z, std::vector<double> &k, std::vector<double> &dc, std::vector<double> &tc, std::vector<double> &db, std::vector<double> &tb,
-                       std::vector<double> &dn, std::vector<double> &tn, std::vector<double> &dm, std::vector<double> &tm)
+  static void check_class_grid(const std::vector<double>& expected, const std::vector<double>& actual)
   {
-    k.clear();
-    dc.clear(); db.clear(); dn.clear(); dm.clear();
-    tc.clear(); tb.clear(); tn.clear(); tm.clear();
+    if (expected != actual)
+      throw std::runtime_error("CLASS returned inconsistent wavenumber grids");
+  }
 
-    // extra vectors for the N-body gauge quantities
-    std::vector<double> k_Nb, dc_Nb, tc_Nb, db_Nb, tb_Nb, dn_Nb, tn_Nb, dm_Nb, tm_Nb;
+  static void validate_class_tables(const class_tables& tables)
+  {
+    if (tables.k.empty())
+      throw std::runtime_error("CLASS returned an empty transfer table");
+    for (const auto& redshift : tables.transfer)
+      for (const auto& values : redshift)
+        if (values.size() != tables.k.size())
+          throw std::runtime_error("CLASS returned transfer vectors with inconsistent sizes");
+  }
 
-    the_ClassEngine_->getTk(z, k, dc, db, dn, dm, tc, tb, tn, tm);
-    the_ClassEngine_Nbody_->getTk(z, k_Nb, dc_Nb, db_Nb, dn_Nb, dm_Nb, tc_Nb, tb_Nb, tn_Nb, tm_Nb);
+  static void validate_raw_transfer(const std::vector<double>& k,
+                                    const std::array<std::vector<double>, 8>& transfer)
+  {
+    if (k.empty())
+      throw std::runtime_error("CLASS returned an empty wavenumber grid");
+    for (const auto& values : transfer)
+      if (values.size() != k.size())
+        throw std::runtime_error("CLASS returned raw transfer vectors with inconsistent sizes");
+  }
 
-    const double h  = cosmo_params_.get("h");
+  //! Execute both CLASS solves and retain only the numerical tables needed below.
+  class_tables calculate_ClassTables(const std::array<double, 5>& redshifts, int threads, bool write_control_file)
+  {
+    omp_team_guard omp_guard(threads);
+    prepare_ClassParameters(write_control_file);
+    class_tables tables;
+    std::array<std::array<std::vector<double>, 8>, 5> synchronous;
+    double wtime = get_wtime();
 
-    for (size_t i = 0; i < k.size(); ++i)
+    music::ilog << "Computing transfer function via ClassEngine... (synchronous gauge)" << std::endl;
     {
-      // Note that ClassEngine uses the opposite sign for the gauge shift
-      // from synchronous to conformal Newtonian gauge compared to CLASS,
-      // possibly in error. We will follow CLASS conventions here.
-
-      // the N-body gauge shift (neglecting only H_T_Nb_prime)
-      real_t theta_shift = tb_Nb[i] - tb[i];
-      // the approximate N-body gauge shift used by ClassEngine (-alpha * k^2)
-      real_t theta_shift_approx = tc[i];
-
-      // undo the approximate N-body gauge transformation done by the ClassEngine
-      tb_Nb[i] = -(tb_Nb[i] - theta_shift_approx);
-      tn_Nb[i] = -(tn_Nb[i] - theta_shift_approx);
-      tm_Nb[i] = -(tm_Nb[i] - theta_shift_approx);
-      // theta_cdm = 0 in synchronous gauge, so exactly equal to -theta_shift
-      tc_Nb[i] = -theta_shift;
-
-      // monofonic requires negative transfer functions here, so we need
-      // to truncate the neutrino transfer functions when errors at large
-      // k send delta_ncdm or theta_ncdm positive
-      dn_Nb[i] = fmin(-FLT_MIN, dn_Nb[i]);
-      tn_Nb[i] = fmin(-FLT_MIN, tn_Nb[i]);
-
-      // finally, export N-body gauge quantities
-      // convert to 'CAMB' format, since we interpolate loglog and
-      // don't want negative numbers...
-      auto ik2 = 1.0 / (k[i] * k[i]) * h * h;
-      dc[i] = -dc_Nb[i] * ik2;
-      db[i] = -db_Nb[i] * ik2;
-      dn[i] = -dn_Nb[i] * ik2;
-      dm[i] = -dm_Nb[i] * ik2;
-      tc[i] = -tc_Nb[i] * ik2;
-      tb[i] = -tb_Nb[i] * ik2;
-      tn[i] = -tn_Nb[i] * ik2;
-      tm[i] = -tm_Nb[i] * ik2;
+      ClassEngine synchronous_engine(pars_, false);
+      for (size_t iz = 0; iz < redshifts.size(); ++iz) {
+        std::vector<double> k;
+        synchronous_engine.getTk(redshifts[iz], k, synchronous[iz][column_dc], synchronous[iz][column_db],
+                                 synchronous[iz][column_dn], synchronous[iz][column_dm], synchronous[iz][column_tc],
+                                 synchronous[iz][column_tb], synchronous[iz][column_tn], synchronous[iz][column_tm]);
+        validate_raw_transfer(k, synchronous[iz]);
+        if (iz == 0)
+          tables.k = k;
+        else
+          check_class_grid(tables.k, k);
+      }
+      // Query this only after all synchronous-gauge samples succeeded.
+      tables.A_s = synchronous_engine.get_A_s();
     }
+
+    music::ilog << "Computing transfer function via ClassEngine... (N-body gauge)" << std::endl;
+    ClassParams nbody_pars = pars_;
+    nbody_pars.add("nbody_gauge_transfer_functions", "yes");
+    {
+      ClassEngine nbody_engine(nbody_pars, false);
+      for (size_t iz = 0; iz < redshifts.size(); ++iz) {
+        std::vector<double> k;
+        std::array<std::vector<double>, 8> nbody;
+        nbody_engine.getTk(redshifts[iz], k, nbody[column_dc], nbody[column_db],
+                           nbody[column_dn], nbody[column_dm], nbody[column_tc],
+                           nbody[column_tb], nbody[column_tn], nbody[column_tm]);
+        validate_raw_transfer(k, nbody);
+        check_class_grid(tables.k, k);
+        for (size_t i = 0; i < k.size(); ++i) {
+          real_t theta_shift = nbody[column_tb][i] - synchronous[iz][column_tb][i];
+          real_t theta_shift_approx = synchronous[iz][column_tc][i];
+          nbody[column_tb][i] = -(nbody[column_tb][i] - theta_shift_approx);
+          nbody[column_tn][i] = -(nbody[column_tn][i] - theta_shift_approx);
+          nbody[column_tm][i] = -(nbody[column_tm][i] - theta_shift_approx);
+          nbody[column_tc][i] = -theta_shift;
+          nbody[column_dn][i] = fmin(-FLT_MIN, nbody[column_dn][i]);
+          nbody[column_tn][i] = fmin(-FLT_MIN, nbody[column_tn][i]);
+          const auto ik2 = 1.0 / (k[i] * k[i]) * cosmo_params_.get("h") * cosmo_params_.get("h");
+          for (size_t column = 0; column < nbody.size(); ++column)
+            tables.transfer[iz][column].push_back(-nbody[column][i] * ik2);
+        }
+      }
+    }
+    validate_class_tables(tables);
+    music::ilog << "CLASS took " << get_wtime() - wtime << " s." << std::endl;
+    return tables;
+  }
+
+  static void report_class_threads(int requested, int available, int using_threads)
+  {
+    std::ostringstream report;
+    report << "Zwindstroom node CLASS execution: requested=" << requested
+           << ", affinity_available=" << available << ", using=" << using_threads
+           << " threads.\n";
+    std::cout << report.str() << std::flush;
+  }
+
+  static int affinity_threads()
+  {
+#if defined(__linux__)
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    if (sched_getaffinity(0, sizeof(cpus), &cpus) == 0) {
+      int available = 0;
+      for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+        if (CPU_ISSET(cpu, &cpus)) ++available;
+      return std::max(1, available);
+    }
+#endif
+    return std::numeric_limits<int>::max();
+  }
+
+#if defined(USE_MPI)
+  static void broadcast_doubles(std::vector<double>& values, int root, MPI_Comm communicator)
+  {
+    size_t offset = 0;
+    while (offset < values.size()) {
+      const int count = static_cast<int>(std::min(values.size() - offset,
+          static_cast<size_t>(std::numeric_limits<int>::max())));
+      MPI_Bcast(values.data() + offset, count, MPI_DOUBLE, root, communicator);
+      offset += static_cast<size_t>(count);
+    }
+  }
+#endif
+
+  class_tables distribute_ClassTables(const std::array<double, 5>& redshifts)
+  {
+    int local_threads = 1;
+#if defined(_OPENMP)
+    local_threads = omp_get_max_threads();
+#endif
+#if defined(USE_MPI)
+    MPI_Comm node_comm = MPI_COMM_NULL;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, CONFIG::MPI_task_rank,
+                        MPI_INFO_NULL, &node_comm);
+    int node_rank = 0;
+    MPI_Comm_rank(node_comm, &node_rank);
+    int requested = 0;
+    MPI_Allreduce(&local_threads, &requested, 1, MPI_INT, MPI_SUM, node_comm);
+    const int available = affinity_threads();
+    const int using_threads = std::min(requested, available);
+    class_tables tables;
+    unsigned long long n = 0;
+    std::vector<double> flat;
+    std::string error;
+    if (node_rank == 0) {
+      report_class_threads(requested, available, using_threads);
+      try {
+        tables = calculate_ClassTables(redshifts, using_threads, CONFIG::MPI_task_rank == 0);
+        n = static_cast<unsigned long long>(tables.k.size());
+        flat.reserve(1 + 41 * tables.k.size());
+        flat.push_back(tables.A_s);
+        flat.insert(flat.end(), tables.k.begin(), tables.k.end());
+        for (const auto& redshift : tables.transfer)
+          for (const auto& values : redshift)
+            flat.insert(flat.end(), values.begin(), values.end());
+        if (flat.size() != 1 + 41 * tables.k.size())
+          throw std::runtime_error("internal error while flattening CLASS transfer tables");
+      } catch (const std::exception& exception) {
+        error = exception.what();
+      } catch (...) {
+        error = "unknown exception while executing CLASS";
+      }
+    }
+    int failed = error.empty() ? 0 : 1;
+    MPI_Bcast(&failed, 1, MPI_INT, 0, node_comm);
+    int any_failed = 0;
+    MPI_Allreduce(&failed, &any_failed, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (any_failed) {
+      int failing_rank = failed ? CONFIG::MPI_task_rank : CONFIG::MPI_task_size;
+      int first_failing_rank = CONFIG::MPI_task_size;
+      MPI_Allreduce(&failing_rank, &first_failing_rank, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+      unsigned long long length = error.size();
+      MPI_Bcast(&length, 1, MPI_UNSIGNED_LONG_LONG, first_failing_rank, MPI_COMM_WORLD);
+      if (CONFIG::MPI_task_rank != first_failing_rank)
+        error.resize(static_cast<size_t>(length));
+      if (length != 0)
+        MPI_Bcast(&error[0], static_cast<int>(length), MPI_CHAR, first_failing_rank, MPI_COMM_WORLD);
+      MPI_Comm_free(&node_comm);
+      throw std::runtime_error("Zwindstroom CLASS failed: " + error);
+    }
+    MPI_Bcast(&n, 1, MPI_UNSIGNED_LONG_LONG, 0, node_comm);
+    if (node_rank != 0)
+      flat.resize(1 + 41 * static_cast<size_t>(n));
+    broadcast_doubles(flat, 0, node_comm);
+    if (node_rank != 0) {
+      size_t offset = 0;
+      tables.A_s = flat[offset++];
+      tables.k.assign(flat.begin() + offset, flat.begin() + offset + n);
+      offset += static_cast<size_t>(n);
+      for (auto& redshift : tables.transfer)
+        for (auto& values : redshift) {
+          values.assign(flat.begin() + offset, flat.begin() + offset + n);
+          offset += static_cast<size_t>(n);
+        }
+      validate_class_tables(tables);
+    }
+    MPI_Comm_free(&node_comm);
+    return tables;
+#else
+    const int requested = local_threads;
+    const int available = affinity_threads();
+    const int using_threads = std::min(requested, available);
+    report_class_threads(requested, available, using_threads);
+    return calculate_ClassTables(redshifts, using_threads, true);
+#endif
   }
 
 public:
@@ -252,8 +459,6 @@ public:
     }
 
     this->tf_isnormalised_ = true;
-
-    ofs_class_input_.open("input_class_parameters.ini", std::ios::trunc);
 
     // all cosmological parameters need to be passed through the_cosmo_calc
 
@@ -287,48 +492,58 @@ public:
     int nres = pcf_->get_value<double>("setup", "GridRes");
     kmax_ = std::max(20.0, 2.0 * M_PI / lbox * nres / 2 * sqrt(3) * 2.0); // 120% of spatial diagonal, or k=10h Mpc-1
 
-    // initialise CLASS and get the normalisation
-    this->init_ClassEngine();
-    double A_s_ = the_ClassEngine_->get_A_s(); // this either the input one, or the one computed from sigma8
+    // CLASS is expensive and is therefore executed once by each node leader.
+    // Every node-local rank receives plain sampled tables and builds its own
+    // interpolation objects below.
+    const double delta_log_a = 0.002;
+    const double log_astart = log(astart_);
+    const double z_min = 1.0 / exp(log_astart - delta_log_a) - 1.0;
+    const double z_pls = 1.0 / exp(log_astart + delta_log_a) - 1.0;
+    const std::array<double, 5> class_redshifts = {{0.0, ztarget_, zstart_, z_min, z_pls}};
+    class_tables class_data = distribute_ClassTables(class_redshifts);
+    double A_s_ = class_data.A_s; // either input A_s or CLASS's sigma8 normalisation
 
     // compute the normalisation to interface with MUSIC
     double k_p = cosmo_params["k_p"] / cosmo_params["h"];
     tnorm_ = std::sqrt(2.0 * M_PI * M_PI * A_s_ * std::pow(1.0 / k_p, cosmo_params["n_s"] - 1) / std::pow(2.0 * M_PI, 3.0));
 
-    // compute the transfer function at z=0 using CLASS engine
-    std::vector<double> k, dc, tc, db, tb, dn, tn, dm, tm;
-    this->run_ClassEngine(0.0, k, dc, tc, db, tb, dn, tn, dm, tm);
+    // Unpack the five CLASS samples.  The order is kept explicit so that the
+    // fluid integration below remains identical to the former rank-local path.
+    std::vector<double> k = class_data.k;
+    std::vector<double> dc = class_data.transfer[sample_zstart][column_dc], tc = class_data.transfer[sample_zstart][column_tc],
+                        db = class_data.transfer[sample_zstart][column_db], tb = class_data.transfer[sample_zstart][column_tb],
+                        dn = class_data.transfer[sample_zstart][column_dn], tn = class_data.transfer[sample_zstart][column_tn],
+                        dm = class_data.transfer[sample_zstart][column_dm], tm = class_data.transfer[sample_zstart][column_tm];
+    const std::vector<double>& dc0 = class_data.transfer[sample_z0][column_dc];
+    const std::vector<double>& tc0 = class_data.transfer[sample_z0][column_tc];
+    const std::vector<double>& db0 = class_data.transfer[sample_z0][column_db];
+    const std::vector<double>& tb0 = class_data.transfer[sample_z0][column_tb];
+    const std::vector<double>& dn0 = class_data.transfer[sample_z0][column_dn];
+    const std::vector<double>& tn0 = class_data.transfer[sample_z0][column_tn];
+    const std::vector<double>& dm0 = class_data.transfer[sample_z0][column_dm];
+    const std::vector<double>& tm0 = class_data.transfer[sample_z0][column_tm];
 
-    delta_c0_.set_data(k, dc);
-    theta_c0_.set_data(k, tc);
-    delta_b0_.set_data(k, db);
-    theta_b0_.set_data(k, tb);
-    delta_n0_.set_data(k, dn);
-    theta_n0_.set_data(k, tn);
-    delta_m0_.set_data(k, dm);
-    theta_m0_.set_data(k, tm);
+    delta_c0_.set_data(k, dc0);
+    theta_c0_.set_data(k, tc0);
+    delta_b0_.set_data(k, db0);
+    theta_b0_.set_data(k, tb0);
+    delta_n0_.set_data(k, dn0);
+    theta_n0_.set_data(k, tn0);
+    delta_m0_.set_data(k, dm0);
+    theta_m0_.set_data(k, tm0);
 
-    // compute the transfer function at z=z_target using CLASS engine
-    std::vector<double> dc_target, tc_target, db_target, tb_target, dn_target, tn_target, dm_target, tm_target;
-    this->run_ClassEngine(ztarget_, k, dc_target, tc_target, db_target, tb_target, dn_target, tn_target, dm_target, tm_target);
-
-    // compute the transfer function at z=z_start using CLASS engine
-    this->run_ClassEngine(zstart_, k, dc, tc, db, tb, dn, tn, dm, tm);
-
-    // evaluate transfer functions at a_min < a_start and a_plus > a_start
-    const double delta_log_a = 0.002;
-    const double log_astart_ = log(astart_);
-    const double a_min = exp(log_astart_ - delta_log_a);
-    const double a_pls = exp(log_astart_ + delta_log_a);
-    const double z_min = 1.0 / a_min - 1.0;
-    const double z_pls = 1.0 / a_pls - 1.0;
-
-    std::vector<double> dc_min, tc_min, db_min, tb_min, dn_min, tn_min, dm_min, tm_min;
-    std::vector<double> dc_pls, tc_pls, db_pls, tb_pls, dn_pls, tn_pls, dm_pls, tm_pls;
-
-    // compute the transfer functions at z=z_min and z=z_plus using CLASS engine
-    this->run_ClassEngine(z_min, k, dc_min, tc_min, db_min, tb_min, dn_min, tn_min, dm_min, tm_min);
-    this->run_ClassEngine(z_pls, k, dc_pls, tc_pls, db_pls, tb_pls, dn_pls, tn_pls, dm_pls, tm_pls);
+    std::vector<double> dc_target = class_data.transfer[sample_ztarget][column_dc], tc_target = class_data.transfer[sample_ztarget][column_tc],
+                        db_target = class_data.transfer[sample_ztarget][column_db], tb_target = class_data.transfer[sample_ztarget][column_tb],
+                        dn_target = class_data.transfer[sample_ztarget][column_dn], tn_target = class_data.transfer[sample_ztarget][column_tn],
+                        dm_target = class_data.transfer[sample_ztarget][column_dm], tm_target = class_data.transfer[sample_ztarget][column_tm];
+    std::vector<double> dc_min = class_data.transfer[sample_zminus][column_dc], tc_min = class_data.transfer[sample_zminus][column_tc],
+                        db_min = class_data.transfer[sample_zminus][column_db], tb_min = class_data.transfer[sample_zminus][column_tb],
+                        dn_min = class_data.transfer[sample_zminus][column_dn], tn_min = class_data.transfer[sample_zminus][column_tn],
+                        dm_min = class_data.transfer[sample_zminus][column_dm], tm_min = class_data.transfer[sample_zminus][column_tm];
+    std::vector<double> dc_pls = class_data.transfer[sample_zplus][column_dc], tc_pls = class_data.transfer[sample_zplus][column_tc],
+                        db_pls = class_data.transfer[sample_zplus][column_db], tb_pls = class_data.transfer[sample_zplus][column_tb],
+                        dn_pls = class_data.transfer[sample_zplus][column_dn], tn_pls = class_data.transfer[sample_zplus][column_tn],
+                        dm_pls = class_data.transfer[sample_zplus][column_dm], tm_pls = class_data.transfer[sample_zplus][column_tm];
 
     // wavenumbers in 1/Mpc
     kmin_ = k[0];

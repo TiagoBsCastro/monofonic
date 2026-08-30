@@ -50,6 +50,7 @@ struct grid_with_ghosts
   /// @brief get task index for a given index
   /// @param index index
   /// @return task index
+#if defined(USE_MPI)
   int get_task(ptrdiff_t index) const
   {
     int itask = 0;
@@ -57,12 +58,14 @@ struct grid_with_ghosts
         ++itask;
     return itask;
   }
+#endif
 
   /// @brief constructor for grid with ghosts
   /// @param g grid to wrap
   explicit grid_with_ghosts(const grid_t &g)
   : gridref(g), nx_(g.n_[0]), ny_(g.n_[1]), nz_(g.n_[2]), nzp_(g.n_[2]+2)
   {
+#if defined(USE_MPI)
     if (is_distributed_trait)
     {
       int ntasks(MPI::get_size());
@@ -81,6 +84,10 @@ struct grid_with_ghosts
 
       update_ghosts_allow_multiple( g );
     }
+#else
+    static_assert(!is_distributed_trait,
+                  "grid_with_ghosts requires MPI for a distributed grid");
+#endif
   }
 
   /// @brief update ghost zones via MPI communication
@@ -189,7 +196,9 @@ struct grid_with_ghosts
 
     MPI_Barrier(MPI_COMM_WORLD);
     
-    #endif
+  #else
+    _unused(g);
+  #endif
   }
 
   /// @brief return the element at position (i,j,k) in the grid
@@ -225,4 +234,3 @@ struct grid_with_ghosts
     return gridref.relem((ix+gridref.n_[0])%gridref.n_[0], iy, iz);
   }
 };
-

@@ -1,0 +1,2066 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 42b33b8ba3b3dcc4f4c5018424fc3e422610014f..cfbee3f4a3e65194fa72d370bb972b612617f67f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -56,6 +56,11 @@ set_target_properties(fastdf_static PROPERTIES C_STANDARD 11)
+ set_property(TARGET fastdf_static PROPERTY POSITION_INDEPENDENT_CODE ON)
+ target_link_libraries(fastdf_static PRIVATE m)
+ target_link_libraries(fastdf_static PRIVATE GSL::gsl)
++target_link_libraries(fastdf_static PUBLIC FFTW3::FFTW3_DOUBLE_SERIAL)
++if(FFTW3_DOUBLE_THREADS_FOUND)
++  target_link_libraries(fastdf_static PUBLIC FFTW3::FFTW3_DOUBLE_THREADS)
++  target_compile_definitions(fastdf_static PRIVATE USE_FFTW_THREADS)
++endif()
+ target_include_directories(fastdf_static PUBLIC include)
+ target_link_libraries(fastdf_static PRIVATE ${HDF5_LIBRARIES})
+ target_include_directories(fastdf_static PRIVATE ${HDF5_INCLUDE_DIRS})
+diff --git a/include/fft.h b/include/fft.h
+index fc7ecaf59a472718850f4ba37a8b5aa39551c266..70056c88c98fcac4156a262301b383db22474797 100644
+--- a/include/fft.h
++++ b/include/fft.h
+@@ -84,12 +84,14 @@ void fft_wavevector(int x, int y, int z, int N, double delta_k, double *kx,
+                     double *ky, double *kz, double *k);
+ void fft_execute(fftw_plan plan);
+ 
+-/* Functions for ordinary contiguous arrays */
+-int fft_normalize_r2c(fftw_complex *arr, int N, double boxlen);
+-int fft_normalize_c2r(double *arr, int N, double boxlen);
++/* Functions for ordinary contiguous arrays.
++ * x_start/x_end let each node rank fill a contiguous x-slice of the (shared)
++ * array: a rank processes x in [x_start, x_end). */
++int fft_normalize_r2c(fftw_complex *arr, int N, double boxlen, int x_start, int x_end);
++int fft_normalize_c2r(double *arr, int N, double boxlen, int x_start, int x_end);
+ int fft_apply_kernel(fftw_complex *write, const fftw_complex *read, int N,
+                      double boxlen, void (*compute)(struct kernel* the_kernel),
+-                     const void *params);
++                     const void *params, int x_start, int x_end);
+ 
+ 
+ #endif
+diff --git a/include/input.h b/include/input.h
+index 5e574f9bc45b8fa7f8bdbbde7889d3e611f021ca..acfca66a72c2b3895919f0b65b2692b845908ef8 100644
+--- a/include/input.h
++++ b/include/input.h
+@@ -35,8 +35,22 @@
+ #include "../parser/minIni.h"
+ // #include "../include/output.h"
+ 
++#include <stddef.h>
+ #include <mpi.h>
+ 
++typedef int (*fastdf_particle_sink)(void *context,
++                                    const void *positions,
++                                    size_t position_stride,
++                                    const void *velocities,
++                                    size_t velocity_stride,
++                                    const void *phase_space_densities,
++                                    size_t phase_space_density_stride,
++                                    unsigned long long count,
++                                    unsigned long long first_id,
++                                    double uniform_mass,
++                                    double neutrino_mass_ev,
++                                    double neutrino_temperature_ev);
++
+ struct params {
+ 
+     /* Box parameters */
+@@ -91,6 +105,10 @@ struct params {
+     char DistributedFiles;
+     char Verbosity;
+ 
++    /* Optional borrowed-particle output used by embedding applications. */
++    fastdf_particle_sink ParticleSink;
++    void *ParticleSinkContext;
++
+     /* MPI rank (generated automatically) */
+     int rank;
+ };
+@@ -123,6 +141,11 @@ int readFieldFileDataSet(double **box, int *N, double *box_len,
+ 
+ int readFieldFile_MPI(double **box, int *N, double *box_len, MPI_Comm comm,
+                       const char *fname);
++/* Read only the grid size and box length (called by node_rank 0; the caller
++ * broadcasts the result). */
++int readFieldHeader(int *N, double *box_len, const char *fname, const char *dset_name);
++/* Read the full N^3 field into a pre-allocated buffer (called by node_rank 0). */
++int readFieldBody(double *box, const char *fname, const char *dset_name, int N);
+ int fileExists(const char *fname);
+ int groupExists(const char *fname, const char *group_name);
+ 
+diff --git a/src/classex.c b/src/classex.c
+index 1965eaae18a5a69d26d2624df91c6e4a7231729d..36a124b1b162de34361040f8ac7d59454feeb0b5 100644
+--- a/src/classex.c
++++ b/src/classex.c
+@@ -241,18 +241,25 @@ int run_class(struct perturb_data *data, struct units *us,
+     if (input_init(class_argc, class_argv, &pr, &ba, &th, &pt,
+                    &ptr, &ppr, &phr, &pfo, &ple, &psd, &op, errmsg) == _FAILURE_) {
+         printf("Error running input_init_from_arguments \n=>%s\n", errmsg);
++        return 1;
+     }
+ 
+     if (background_init(&pr, &ba) == _FAILURE_) {
+         printf("Error running background_init \n%s\n", ba.error_message);
++        return 1;
+     }
+ 
+     if (thermodynamics_init(&pr, &ba, &th) == _FAILURE_) {
+         printf("Error in thermodynamics_init \n%s\n", th.error_message);
++        background_free(&ba);
++        return 1;
+     }
+ 
+     if (perturbations_init(&pr, &ba, &th, &pt) == _FAILURE_) {
+         printf("Error in perturbations_init \n%s\n", pt.error_message);
++        thermodynamics_free(&th);
++        background_free(&ba);
++        return 1;
+     }
+     
+     /* Read perturb data */
+@@ -299,25 +306,28 @@ int run_class(struct perturb_data *data, struct units *us,
+         pt.beta_idr = (double *)malloc(0);
+     }
+ 
+-    /* Close CLASS again */
++    /* Close CLASS again. Attempt every cleanup even if an earlier one fails so
++     * a synchronized caller can report the error without retaining the other
++     * successfully initialized modules. */
++    int cleanup_status = 0;
+     if (perturbations_free(&pt) == _FAILURE_) {
+         printf("Error in freeing class memory \n%s\n", pt.error_message);
+-        return 1;
++        cleanup_status = 1;
+     }
+ 
+     if (thermodynamics_free(&th) == _FAILURE_) {
+         printf("Error in thermodynamics_free \n%s\n", th.error_message);
+-        return 1;
++        cleanup_status = 1;
+     }
+ 
+     if (background_free(&ba) == _FAILURE_) {
+         printf("Error in background_free \n%s\n", ba.error_message);
+-        return 1;
++        cleanup_status = 1;
+     }
+     
+     
+     
+-    return 0;
++    return cleanup_status;
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/fft.c b/src/fft.c
+index 47db38892eefc29649a7b675751fcd7762e1f5ce..23fe58bb0521fc499eee81f958fcd0534655cf14 100644
+--- a/src/fft.c
++++ b/src/fft.c
+@@ -35,9 +35,9 @@ void fft_wavevector(int x, int y, int z, int N, double delta_k, double *kx,
+ }
+ 
+ /* Normalize the complex array after transforming to momentum space */
+-int fft_normalize_r2c(fftw_complex *arr, int N, double boxlen) {
++int fft_normalize_r2c(fftw_complex *arr, int N, double boxlen, int x_start, int x_end) {
+     const double boxvol = boxlen*boxlen*boxlen;
+-    for (int x=0; x<N; x++) {
++    for (int x=x_start; x<x_end; x++) {
+         for (int y=0; y<N; y++) {
+             for (int z=0; z<=N/2; z++) {
+                 arr[row_major_half(x, y, z, N)] *= boxvol/(N*N*N);
+@@ -49,9 +49,9 @@ int fft_normalize_r2c(fftw_complex *arr, int N, double boxlen) {
+ }
+ 
+ /* Normalize the real array after transforming to configuration space */
+-int fft_normalize_c2r(double *arr, int N, double boxlen) {
++int fft_normalize_c2r(double *arr, int N, double boxlen, int x_start, int x_end) {
+     const double boxvol = boxlen*boxlen*boxlen;
+-    for (int x=0; x<N; x++) {
++    for (int x=x_start; x<x_end; x++) {
+         for (int y=0; y<N; y++) {
+             for (int z=0; z<N; z++) {
+                 arr[row_major(x, y, z, N)] /= boxvol;
+@@ -70,11 +70,11 @@ void fft_execute(fftw_plan plan) {
+ /* Apply a kernel to a 3D array after transforming to momentum space */
+ int fft_apply_kernel(fftw_complex *write, const fftw_complex *read, int N,
+                      double boxlen, void (*compute)(struct kernel* the_kernel),
+-                     const void *params) {
++                     const void *params, int x_start, int x_end) {
+     const double dk = 2 * M_PI / boxlen;
+ 
+     #pragma omp parallel for
+-    for (int x=0; x<N; x++) {
++    for (int x=x_start; x<x_end; x++) {
+         for (int y=0; y<N; y++) {
+             for (int z=0; z<=N/2; z++) {
+                 /* Calculate the wavevector */
+diff --git a/src/input.c b/src/input.c
+index 7bdd6270725af230315660b02cc2de6c97e5a2b9..c2ab5e53dd0f9f5d6640dc8511607bf684b742d1 100644
+--- a/src/input.c
++++ b/src/input.c
+@@ -21,6 +21,7 @@
+ #include <string.h>
+ #include <hdf5.h>
+ #include <assert.h>
++#include <limits.h>
+ #include <math.h>
+ #include "../include/input.h"
+ 
+@@ -165,6 +166,7 @@ int cleanParams(struct params *pars) {
+     free(pars->OutputFilename);
+     free(pars->PerturbFile);
+     free(pars->GaussianRandomFieldFile);
++    free(pars->GaussianRandomFieldDataset);
+     free(pars->TransferFunctionDensity);
+     free(pars->Gauge);
+     free(pars->ClassIniFile);
+@@ -463,6 +465,216 @@ int readFieldFile_MPI(double **box, int *N, double *box_len, MPI_Comm comm,
+ #endif
+ }
+ 
++/* Open objects whose absence is reported by FastDF without leaving HDF5's
++ * automatic error handler disabled for subsequent I/O. */
++static hid_t openFileQuietly(const char *fname) {
++    hid_t h_file = -1;
++    H5E_BEGIN_TRY
++    h_file = H5Fopen(fname, H5F_ACC_RDONLY, H5P_DEFAULT);
++    H5E_END_TRY
++    return h_file;
++}
++
++static hid_t openDataSetQuietly(hid_t h_file, const char *dset_name) {
++    hid_t h_data = -1;
++    H5E_BEGIN_TRY
++    h_data = H5Dopen2(h_file, dset_name, H5P_DEFAULT);
++    H5E_END_TRY
++    return h_data;
++}
++
++/* Read only the grid size N and box length from the white-noise file.
++ * This is called by node_rank 0; the caller broadcasts the result to the
++ * other ranks in the node.  Every HDF5 handle is checked and every error path
++ * closes the handles it has opened and frees the temporary allocations, so an
++ * early return cannot leak handles or memory. */
++int readFieldHeader(int *N, double *box_len, const char *fname, const char *dset_name) {
++    hid_t h_file = openFileQuietly(fname);
++    if (h_file < 0) {
++        printf("Error: could not open white-noise file '%s'.\n", fname);
++        return 1;
++    }
++
++    /* Read the BoxSize attribute from the Header group if present. */
++    htri_t h_exists = H5Lexists(h_file, "/Header", H5P_DEFAULT);
++    if (h_exists < 0) {
++        H5Fclose(h_file);
++        return 1;
++    }
++    if (h_exists > 0) {
++        hid_t h_grp = H5Gopen(h_file, "Header", H5P_DEFAULT);
++        if (h_grp < 0) {
++            H5Fclose(h_file);
++            return 1;
++        }
++        hid_t h_attr = H5Aopen(h_grp, "BoxSize", H5P_DEFAULT);
++        if (h_attr < 0) {
++            H5Gclose(h_grp);
++            H5Fclose(h_file);
++            return 1;
++        }
++        hid_t h_attr_space = H5Aget_space(h_attr);
++        if (h_attr_space < 0 || H5Sget_simple_extent_ndims(h_attr_space) != 1 ||
++            H5Sget_simple_extent_npoints(h_attr_space) != 3) {
++            printf("Error: hdf5 attribute '%s' must contain exactly three values.\n", "BoxSize");
++            if (h_attr_space >= 0) H5Sclose(h_attr_space);
++            H5Aclose(h_attr);
++            H5Gclose(h_grp);
++            H5Fclose(h_file);
++            return 2;
++        }
++        H5Sclose(h_attr_space);
++
++        double boxsize[3];
++        if (H5Aread(h_attr, H5T_NATIVE_DOUBLE, &boxsize) < 0) {
++            printf("Error reading hdf5 attribute '%s'.\n", "BoxSize");
++            H5Aclose(h_attr);
++            H5Gclose(h_grp);
++            H5Fclose(h_file);
++            return 1;
++        }
++        H5Aclose(h_attr);
++        H5Gclose(h_grp);
++        if (boxsize[0] != boxsize[1] || boxsize[1] != boxsize[2]) {
++            printf("Error: non-cubic box size (%g, %g, %g).\n", boxsize[0], boxsize[1], boxsize[2]);
++            H5Fclose(h_file);
++            return 2;
++        }
++        *box_len = boxsize[0];
++    }
++
++    /* Open the dataset and fetch the grid dimensions. */
++    hid_t h_data = openDataSetQuietly(h_file, dset_name);
++    if (h_data < 0) {
++        printf("Error: could not open dataset '%s'.\n", dset_name);
++        H5Fclose(h_file);
++        return 1;
++    }
++    hid_t h_space = H5Dget_space(h_data);
++    if (h_space < 0) {
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
++    int ndims = H5Sget_simple_extent_ndims(h_space);
++    if (ndims < 0) {
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
++    /* It should be 3D and cubic (but allow padding in the last dimension). */
++    if (ndims != 3) {
++        printf("Number of dimensions %d != 3.\n", ndims);
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 2;
++    }
++    hsize_t dims[3];
++    if (H5Sget_simple_extent_dims(h_space, dims, NULL) < 0) {
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
++    if (dims[0] == 0 || dims[0] > INT_MAX) {
++        printf("Invalid grid size %llu.\n", (unsigned long long)dims[0]);
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 2;
++    }
++    int read_N = (int)dims[0];
++    if (read_N != (int)dims[1] || (read_N != (int)dims[2] && (read_N + 2) != (int)dims[2])) {
++        printf("Non-cubic grid size (%lld, %lld, %lld).\n",
++               (long long)dims[0], (long long)dims[1], (long long)dims[2]);
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 2;
++    }
++    *N = read_N;
++
++    H5Sclose(h_space);
++    H5Dclose(h_data);
++    H5Fclose(h_file);
++
++    return 0;
++}
++
++/* Read the full N^3 white-noise field into a pre-allocated buffer.
++ * Called by node_rank 0; the field is then shared via a memory window. */
++int readFieldBody(double *box, const char *fname, const char *dset_name, int N) {
++    if (box == NULL || N <= 0) return 1;
++
++    hid_t h_file = openFileQuietly(fname);
++    if (h_file < 0) {
++        printf("Error: could not open white-noise file '%s'.\n", fname);
++        return 1;
++    }
++
++    hid_t h_data = openDataSetQuietly(h_file, dset_name);
++    if (h_data < 0) {
++        printf("Error: could not open dataset '%s'.\n", dset_name);
++        H5Fclose(h_file);
++        return 1;
++    }
++    hid_t h_space = H5Dget_space(h_data);
++    if (h_space < 0) {
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
++
++    int ndims = H5Sget_simple_extent_ndims(h_space);
++    hsize_t dims[3];
++    if (ndims != 3 || H5Sget_simple_extent_dims(h_space, dims, NULL) < 0 ||
++        dims[0] != (hsize_t)N || dims[1] != (hsize_t)N ||
++        (dims[2] != (hsize_t)N && dims[2] != (hsize_t)(N + 2))) {
++        printf("Error: white-noise dataset dimensions changed before reading.\n");
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 2;
++    }
++
++    /* The hyperslab that should be read (needed in case of padding). */
++    const hsize_t space_rank = 3;
++    const hsize_t space_dims[3] = {(hsize_t)N, (hsize_t)N, (hsize_t)N};
++    const hsize_t space_offset[3] = {0, 0, 0};
++
++    hid_t h_memspace = H5Screate_simple(space_rank, space_dims, NULL);
++    if (h_memspace < 0) {
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
++    if (H5Sselect_hyperslab(h_space, H5S_SELECT_SET, space_offset, NULL, space_dims, NULL) < 0) {
++        H5Sclose(h_memspace);
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
++
++    if (H5Dread(h_data, H5T_NATIVE_DOUBLE, h_memspace, h_space, H5P_DEFAULT, box) < 0) {
++        printf("Error reading hdf5 file '%s'.\n", fname);
++        H5Sclose(h_memspace);
++        H5Sclose(h_space);
++        H5Dclose(h_data);
++        H5Fclose(h_file);
++        return 1;
++    }
++
++    H5Sclose(h_memspace);
++    H5Sclose(h_space);
++    H5Dclose(h_data);
++    H5Fclose(h_file);
++
++    return 0;
++}
+ 
+ int fileExists(const char *fname) {
+     int exists = 0;
+diff --git a/src/runner.c b/src/runner.c
+index 98a49233621a570d61941e16496fdbbbb3f41778..a0e022410af7ab3daf2efdc7390bcec855e8bbcb 100644
+--- a/src/runner.c
++++ b/src/runner.c
+@@ -17,16 +17,324 @@
+  *
+  ******************************************************************************/
+ 
++/* sched_getaffinity() and the CPU_* macros are GNU/Linux extensions. */
++#if defined(__linux__) && !defined(_GNU_SOURCE)
++#define _GNU_SOURCE
++#endif
++
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <hdf5.h>
+ #include <assert.h>
++#include <limits.h>
++#include <stdint.h>
+ #include <math.h>
+ #include <sys/time.h>
++#ifdef __linux__
++#include <sched.h>
++#endif
++#ifdef _OPENMP
++#include <omp.h>
++#endif
+ 
+ #include "../include/fastdf.h"
+ 
++/* Synchronize shared-memory access to the grid window.
++ *
++ * Shared grids are accessed through ordinary load/store operations.
++ *
++ * MPI_Win_sync + a node-local barrier is conceptually suitable for this usage
++ * under the unified memory model. However, the tested MPICH configuration
++ * returned MPI_ERR_RMA_SYNC for that implementation path.
++ *
++ * We therefore retain MPI_Win_fence here because it provides the required
++ * synchronization semantics on the MPI implementations tested for monofonIC.
++ * This is an implementation/portability choice rather than a requirement that
++ * MPI_Win_sync always needs an active exposure epoch. */
++static inline void shared_grid_sync(MPI_Win win, MPI_Comm comm) {
++    (void)comm;
++    MPI_Win_fence(0, win);
++}
++
++/* Count CPUs on which the node leader is actually allowed to execute.  This
++ * keeps the FFTW thread pool inside the process affinity mask when the MPI
++ * launcher pins ranks.  On non-Linux systems, retain the rank-local OpenMP
++ * thread count as the conservative fallback. */
++static int fastdf_allowed_cpu_count(int fallback) {
++#ifdef __linux__
++    cpu_set_t mask;
++    CPU_ZERO(&mask);
++    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
++        int count = 0;
++        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
++            count += CPU_ISSET(cpu, &mask) != 0;
++        if (count > 0)
++            return count;
++    }
++#endif
++    return fallback > 0 ? fallback : 1;
++}
++
++static void fastdf_destroy_fft_plans(fftw_plan *plans, size_t count) {
++    for (size_t i = 0; i < count; i++) {
++        if (plans[i] != NULL) {
++            fftw_destroy_plan(plans[i]);
++            plans[i] = NULL;
++        }
++    }
++}
++
++static int fastdf_size_add(size_t *total, size_t count) {
++    if (count > SIZE_MAX - *total)
++        return 1;
++    *total += count;
++    return 0;
++}
++
++static int fastdf_size_multiply(size_t left, size_t right, size_t *product) {
++    if (left != 0 && right > SIZE_MAX / left)
++        return 1;
++    *product = left * right;
++    return 0;
++}
++
++/* Publish the plain arrays extracted from CLASS in one node-local shared
++ * window. The structs and title-pointer arrays remain rank-local because a
++ * shared window is not required to have the same virtual address on every
++ * process. */
++static int fastdf_share_perturb_tables(MPI_Comm node_comm, int node_rank,
++                                       const struct perturb_data *leader_data,
++                                       const struct perturb_params *leader_params,
++                                       struct perturb_data *data,
++                                       struct perturb_params *params,
++                                       MPI_Win *shared_window) {
++    int dimensions[4] = {0, 0, 0, 0};
++    double cosmology[7] = {0};
++    if (node_rank == 0) {
++        dimensions[0] = leader_data->k_size;
++        dimensions[1] = leader_data->tau_size;
++        dimensions[2] = leader_data->n_functions;
++        dimensions[3] = leader_params->N_ncdm;
++        cosmology[0] = leader_params->T_CMB;
++        cosmology[1] = leader_params->h;
++        cosmology[2] = leader_params->Omega_lambda;
++        cosmology[3] = leader_params->Omega_k;
++        cosmology[4] = leader_params->Omega_m;
++        cosmology[5] = leader_params->Omega_b;
++        cosmology[6] = leader_params->Omega_ur;
++    }
++
++    int mpi_status = MPI_Bcast(dimensions, 4, MPI_INT, 0, node_comm);
++    if (mpi_status == MPI_SUCCESS)
++        mpi_status = MPI_Bcast(cosmology, 7, MPI_DOUBLE, 0, node_comm);
++    if (mpi_status != MPI_SUCCESS)
++        return 1;
++
++    const int k_size = dimensions[0];
++    const int tau_size = dimensions[1];
++    const int n_functions = dimensions[2];
++    const int n_ncdm = dimensions[3];
++    int local_failed = k_size <= 0 || tau_size <= 0 || n_functions <= 0 || n_ncdm < 0;
++    if (node_rank == 0) {
++        local_failed |= leader_data->k == NULL || leader_data->log_tau == NULL ||
++                        leader_data->redshift == NULL || leader_data->Hubble_H == NULL ||
++                        leader_data->delta == NULL || leader_data->Omega == NULL ||
++                        leader_data->titles == NULL;
++        local_failed |= n_ncdm > 0 &&
++                        (leader_params->M_ncdm_eV == NULL || leader_params->T_ncdm == NULL);
++    }
++    int node_failed = 0;
++    MPI_Allreduce(&local_failed, &node_failed, 1, MPI_INT, MPI_MAX, node_comm);
++    if (node_failed)
++        return 1;
++
++    int *title_lengths = malloc((size_t)n_functions * sizeof(*title_lengths));
++    local_failed = title_lengths == NULL;
++    MPI_Allreduce(&local_failed, &node_failed, 1, MPI_INT, MPI_MAX, node_comm);
++    if (node_failed) {
++        free(title_lengths);
++        return 1;
++    }
++
++    local_failed = 0;
++    if (node_rank == 0) {
++        for (int i = 0; i < n_functions; i++) {
++            if (leader_data->titles[i] == NULL) {
++                local_failed = 1;
++                break;
++            }
++            size_t length = strlen(leader_data->titles[i]) + 1;
++            if (length > INT_MAX) {
++                local_failed = 1;
++                break;
++            }
++            title_lengths[i] = (int)length;
++        }
++    }
++    MPI_Bcast(&local_failed, 1, MPI_INT, 0, node_comm);
++    if (!local_failed)
++        mpi_status = MPI_Bcast(title_lengths, n_functions, MPI_INT, 0, node_comm);
++    if (local_failed || mpi_status != MPI_SUCCESS) {
++        free(title_lengths);
++        return 1;
++    }
++
++    size_t delta_count = 0;
++    size_t omega_count = 0;
++    size_t tau_vectors_count = 0;
++    size_t ncdm_vectors_count = 0;
++    size_t double_count = 0;
++    size_t title_bytes = 0;
++    local_failed = fastdf_size_multiply((size_t)n_functions, (size_t)k_size,
++                                        &delta_count) ||
++                   fastdf_size_multiply(delta_count, (size_t)tau_size,
++                                        &delta_count) ||
++                   fastdf_size_multiply((size_t)n_functions, (size_t)tau_size,
++                                        &omega_count) ||
++                   fastdf_size_multiply(3, (size_t)tau_size,
++                                        &tau_vectors_count) ||
++                   fastdf_size_multiply(2, (size_t)n_ncdm,
++                                        &ncdm_vectors_count);
++    local_failed |= fastdf_size_add(&double_count, (size_t)k_size) ||
++                    fastdf_size_add(&double_count, tau_vectors_count) ||
++                    fastdf_size_add(&double_count, delta_count) ||
++                    fastdf_size_add(&double_count, omega_count) ||
++                    fastdf_size_add(&double_count, ncdm_vectors_count);
++    for (int i = 0; i < n_functions && !local_failed; i++) {
++        local_failed |= title_lengths[i] <= 0 ||
++                        fastdf_size_add(&title_bytes, (size_t)title_lengths[i]);
++    }
++
++    size_t double_bytes = 0;
++    size_t total_bytes = 0;
++    local_failed |= fastdf_size_multiply(double_count, sizeof(double), &double_bytes) ||
++                    fastdf_size_add(&total_bytes, double_bytes) ||
++                    fastdf_size_add(&total_bytes, title_bytes);
++    MPI_Aint allocation_size = 0;
++    if (!local_failed && node_rank == 0) {
++        allocation_size = (MPI_Aint)total_bytes;
++        local_failed = allocation_size < 0 || (size_t)allocation_size != total_bytes;
++    }
++    MPI_Allreduce(&local_failed, &node_failed, 1, MPI_INT, MPI_MAX, node_comm);
++    if (node_failed) {
++        free(title_lengths);
++        return 1;
++    }
++
++    void *shared_base = NULL;
++    MPI_Win window = MPI_WIN_NULL;
++    mpi_status = MPI_Win_allocate_shared(allocation_size, sizeof(double), MPI_INFO_NULL,
++                                         node_comm, &shared_base, &window);
++    int local_window_valid = mpi_status == MPI_SUCCESS;
++    int node_window_valid = 0;
++    MPI_Allreduce(&local_window_valid, &node_window_valid, 1, MPI_INT, MPI_MIN,
++                  node_comm);
++    if (!node_window_valid) {
++        if (local_window_valid)
++            MPI_Win_free(&window);
++        free(title_lengths);
++        return 1;
++    }
++    MPI_Win_set_errhandler(window, MPI_ERRORS_RETURN);
++
++    MPI_Aint shared_size = 0;
++    int displacement = 0;
++    mpi_status = MPI_Win_shared_query(window, 0, &shared_size, &displacement,
++                                      &shared_base);
++    local_failed = mpi_status != MPI_SUCCESS || shared_base == NULL ||
++                   shared_size < 0 || (size_t)shared_size < total_bytes;
++    MPI_Allreduce(&local_failed, &node_failed, 1, MPI_INT, MPI_MAX, node_comm);
++    if (node_failed) {
++        MPI_Win_free(&window);
++        free(title_lengths);
++        return 1;
++    }
++
++    char **titles = malloc((size_t)n_functions * sizeof(*titles));
++    local_failed = titles == NULL;
++    MPI_Allreduce(&local_failed, &node_failed, 1, MPI_INT, MPI_MAX, node_comm);
++    if (node_failed) {
++        free(titles);
++        MPI_Win_free(&window);
++        free(title_lengths);
++        return 1;
++    }
++
++    double *cursor = (double *)shared_base;
++    data->k_size = k_size;
++    data->tau_size = tau_size;
++    data->n_functions = n_functions;
++    data->k = cursor;
++    cursor += k_size;
++    data->log_tau = cursor;
++    cursor += tau_size;
++    data->redshift = cursor;
++    cursor += tau_size;
++    data->Hubble_H = cursor;
++    cursor += tau_size;
++    data->delta = cursor;
++    cursor += delta_count;
++    data->Omega = cursor;
++    cursor += omega_count;
++
++    params->N_ncdm = n_ncdm;
++    params->M_ncdm_eV = n_ncdm > 0 ? cursor : NULL;
++    cursor += n_ncdm;
++    params->T_ncdm = n_ncdm > 0 ? cursor : NULL;
++    cursor += n_ncdm;
++    params->T_CMB = cosmology[0];
++    params->h = cosmology[1];
++    params->Omega_lambda = cosmology[2];
++    params->Omega_k = cosmology[3];
++    params->Omega_m = cosmology[4];
++    params->Omega_b = cosmology[5];
++    params->Omega_ur = cosmology[6];
++
++    char *title_cursor = (char *)cursor;
++    data->titles = titles;
++    for (int i = 0; i < n_functions; i++) {
++        data->titles[i] = title_cursor;
++        title_cursor += title_lengths[i];
++    }
++
++    if (node_rank == 0) {
++        memcpy(data->k, leader_data->k, (size_t)k_size * sizeof(double));
++        memcpy(data->log_tau, leader_data->log_tau, (size_t)tau_size * sizeof(double));
++        memcpy(data->redshift, leader_data->redshift, (size_t)tau_size * sizeof(double));
++        memcpy(data->Hubble_H, leader_data->Hubble_H, (size_t)tau_size * sizeof(double));
++        memcpy(data->delta, leader_data->delta, delta_count * sizeof(double));
++        memcpy(data->Omega, leader_data->Omega, omega_count * sizeof(double));
++        if (n_ncdm > 0) {
++            memcpy(params->M_ncdm_eV, leader_params->M_ncdm_eV,
++                   (size_t)n_ncdm * sizeof(double));
++            memcpy(params->T_ncdm, leader_params->T_ncdm,
++                   (size_t)n_ncdm * sizeof(double));
++        }
++        for (int i = 0; i < n_functions; i++)
++            memcpy(data->titles[i], leader_data->titles[i], (size_t)title_lengths[i]);
++    }
++
++    shared_grid_sync(window, node_comm);
++    free(title_lengths);
++    *shared_window = window;
++    return 0;
++}
++
++static void fastdf_clean_perturb_tables(struct perturb_data *data,
++                                        struct perturb_params *params,
++                                        int shared, MPI_Win *shared_window) {
++    if (shared) {
++        free(data->titles);
++        data->titles = NULL;
++        if (*shared_window != MPI_WIN_NULL)
++            MPI_Win_free(shared_window);
++    } else {
++        cleanPerturb(data);
++        cleanPerturbParams(params);
++    }
++}
++
+ // Returns the number of local particles generated
+ long long run_fastdf(struct params *pars, struct units *us) {
+     
+@@ -38,6 +346,93 @@ long long run_fastdf(struct params *pars, struct units *us) {
+     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+     MPI_Comm_size(MPI_COMM_WORLD, &MPI_Rank_Count);
+ 
++    /* Node-local communicator (ranks sharing physical memory) */
++    MPI_Comm node_comm = MPI_COMM_NULL;
++    int mpi_status = MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0,
++                                         MPI_INFO_NULL, &node_comm);
++    if (mpi_status != MPI_SUCCESS) {
++        printf("Error: could not create the node-local communicator (status %d).\n", mpi_status);
++        return -1;
++    }
++    MPI_Comm_set_errhandler(node_comm, MPI_ERRORS_RETURN);
++    int node_rank, node_size;
++    MPI_Comm_rank(node_comm, &node_rank);
++    MPI_Comm_size(node_comm, &node_size);
++
++    /* Grid filling remains distributed across the node ranks, using each
++     * rank's normal OpenMP thread count.  During an FFT, all non-leader ranks
++     * wait, so the node leader may safely borrow the sum of those thread counts
++     * provided its process affinity mask includes the corresponding CPUs. */
++    int fill_threads = 1;
++#ifdef _OPENMP
++    fill_threads = omp_get_max_threads();
++    if (fill_threads < 1) fill_threads = 1;
++#endif
++    long long local_fill_threads = fill_threads;
++    long long requested_leader_threads_ll = 1;
++    MPI_Reduce(&local_fill_threads, &requested_leader_threads_ll, 1, MPI_LONG_LONG,
++               MPI_SUM, 0, node_comm);
++
++    int requested_leader_threads = 1;
++    int allowed_leader_cpus = 1;
++    int leader_threads = 1;
++    int fft_threads = 1;
++#ifdef USE_FFTW_THREADS
++    int fftw_threads_initialized = 0;
++#endif
++    if (node_rank == 0) {
++        requested_leader_threads = requested_leader_threads_ll > INT_MAX
++                                 ? INT_MAX : (int)requested_leader_threads_ll;
++        allowed_leader_cpus = fastdf_allowed_cpu_count(fill_threads);
++        leader_threads = requested_leader_threads < allowed_leader_cpus
++                       ? requested_leader_threads : allowed_leader_cpus;
++        if (leader_threads < 1) leader_threads = 1;
++        fft_threads = leader_threads;
++        if (fft_threads < 1) fft_threads = 1;
++#ifdef USE_FFTW_THREADS
++        fftw_threads_initialized = fftw_init_threads();
++        if (fftw_threads_initialized) {
++            fftw_plan_with_nthreads(fft_threads);
++        } else {
++            fft_threads = 1;
++        }
++#else
++        fft_threads = 1;
++#endif
++
++        char processor_name[MPI_MAX_PROCESSOR_NAME + 1];
++        int processor_name_length = 0;
++        MPI_Get_processor_name(processor_name, &processor_name_length);
++        if (processor_name_length > MPI_MAX_PROCESSOR_NAME)
++            processor_name_length = MPI_MAX_PROCESSOR_NAME;
++        processor_name[processor_name_length] = '\0';
++        printf("FastDF node FFT on %s (world rank %d): requested=%d, "
++               "affinity_available=%d, using=%d thread%s.\n",
++               processor_name, rank, requested_leader_threads, allowed_leader_cpus,
++               fft_threads, fft_threads == 1 ? "" : "s");
++        if (fft_threads < requested_leader_threads
++#ifdef USE_FFTW_THREADS
++            || !fftw_threads_initialized
++#endif
++        ) {
++#ifdef USE_FFTW_THREADS
++            if (fftw_threads_initialized) {
++                printf("FastDF warning on %s: the node leader cannot borrow all "
++                       "requested CPUs; relax per-rank binding (for example, "
++                       "mpirun --bind-to none) to enable the full FFT thread pool.\n",
++                       processor_name);
++            } else {
++                printf("FastDF warning on %s: FFTW thread initialization failed; "
++                       "falling back to serial node-leader FFTs.\n", processor_name);
++            }
++#else
++            printf("FastDF warning on %s: the FFTW threads library is unavailable; "
++                   "falling back to serial node-leader FFTs.\n", processor_name);
++#endif
++        }
++        fflush(stdout);
++    }
++
+     /* The level of verbosity */
+     const int verbosity = pars->Verbosity;
+     const int verbosity_low = rank + (verbosity == 0); // low priority
+@@ -46,9 +441,11 @@ long long run_fastdf(struct params *pars, struct units *us) {
+     /* Read options */
+     header(verbosity_high, "FastDF Neutrino Initial Condition Generator");
+ 
+-    struct perturb_data ptdat;
+-    struct perturb_spline spline;
+-    struct perturb_params ptpars;
++    struct perturb_data ptdat = {0};
++    struct perturb_spline spline = {0};
++    struct perturb_params ptpars = {0};
++    MPI_Win perturb_window = MPI_WIN_NULL;
++    int perturb_tables_shared = 0;
+ 
+     /* Store the MPI rank */
+     pars->rank = rank;
+@@ -76,18 +473,20 @@ long long run_fastdf(struct params *pars, struct units *us) {
+         sprintf(out_fname_local, "%s", out_fname);
+     }
+ 
+-    /* Check if this file already exists */
+-    int file_exists = fileExists(out_fname_local);
++    if (pars->ParticleSink == NULL) {
++        /* Check if this file already exists */
++        int file_exists = fileExists(out_fname_local);
+ 
+-    /* The ExportName for the neutrino particles */
+-    const char *ExportName = pars->ExportName;
+-    int group_exists = groupExists(out_fname_local, ExportName);
++        /* The ExportName for the neutrino particles */
++        const char *ExportName = pars->ExportName;
++        int group_exists = groupExists(out_fname_local, ExportName);
+ 
+-    if (file_exists && group_exists) {
+-        printf("Error: file '%s' already exists and has a neutrino particle group.\n", out_fname_local);
+-        exit(1);
+-    } else if (file_exists && !group_exists) {
+-        message(verbosity_low, "Appending neutrino particles to '%s'.\n", out_fname_local);
++        if (file_exists && group_exists) {
++            printf("Error: file '%s' already exists and has a neutrino particle group.\n", out_fname_local);
++            exit(1);
++        } else if (file_exists && !group_exists) {
++            message(verbosity_low, "Appending neutrino particles to '%s'.\n", out_fname_local);
++        }
+     }
+ 
+     /* Check if the user specified a perturbation data file or if CLASS
+@@ -98,14 +497,80 @@ long long run_fastdf(struct params *pars, struct units *us) {
+         readPerturbParams(pars, us, &ptpars);
+     } else {
+ #ifdef WITH_CLASS
+-        /* Run CLASS */
+-        run_class(&ptdat, us, &ptpars, pars->ClassIniFile, /* verbose = */ pars->rank == 0);
++        /* CLASS is OpenMP-parallel but not MPI-parallel. Run it once on each
++         * physical node, allowing the node leader to borrow all CPUs visible in
++         * its affinity mask while its peers wait. The extracted read-only tables
++         * are then published to those peers through shared memory. */
++        struct perturb_data leader_data = {0};
++        struct perturb_params leader_params = {0};
++        int class_status = 0;
++        if (node_rank == 0) {
++            char processor_name[MPI_MAX_PROCESSOR_NAME + 1];
++            int processor_name_length = 0;
++            MPI_Get_processor_name(processor_name, &processor_name_length);
++            if (processor_name_length > MPI_MAX_PROCESSOR_NAME)
++                processor_name_length = MPI_MAX_PROCESSOR_NAME;
++            processor_name[processor_name_length] = '\0';
++
++            int class_threads = 1;
++#ifdef _OPENMP
++            const int previous_threads = omp_get_max_threads();
++            const int previous_dynamic = omp_get_dynamic();
++            class_threads = leader_threads;
++            omp_set_dynamic(0);
++            omp_set_num_threads(class_threads);
++#endif
++            printf("FastDF node CLASS on %s (world rank %d): requested=%d, "
++                   "affinity_available=%d, using=%d thread%s.\n",
++                   processor_name, rank, requested_leader_threads,
++                   allowed_leader_cpus, class_threads,
++                   class_threads == 1 ? "" : "s");
++            fflush(stdout);
++            class_status = run_class(&leader_data, us, &leader_params,
++                                     pars->ClassIniFile, /* verbose = */ rank == 0);
++#ifdef _OPENMP
++            omp_set_num_threads(previous_threads);
++            omp_set_dynamic(previous_dynamic);
++#endif
++        }
++
++        MPI_Bcast(&class_status, 1, MPI_INT, 0, node_comm);
++        int global_class_status = 0;
++        MPI_Allreduce(&class_status, &global_class_status, 1, MPI_INT, MPI_MAX,
++                      MPI_COMM_WORLD);
++        if (global_class_status == 0)
++            class_status = fastdf_share_perturb_tables(node_comm, node_rank,
++                                                       &leader_data, &leader_params,
++                                                       &ptdat, &ptpars,
++                                                       &perturb_window);
++
++        if (node_rank == 0) {
++            cleanPerturb(&leader_data);
++            cleanPerturbParams(&leader_params);
++        }
++
++        int global_share_status = global_class_status;
++        MPI_Allreduce(&class_status, &global_share_status, 1, MPI_INT, MPI_MAX,
++                      MPI_COMM_WORLD);
++        if (global_share_status != 0) {
++            if (class_status == 0)
++                fastdf_clean_perturb_tables(&ptdat, &ptpars, 1,
++                                            &perturb_window);
++            if (rank == 0)
++                printf("Error: node-leader CLASS execution or table sharing failed.\n");
++            MPI_Comm_free(&node_comm);
++            cleanParams(pars);
++            return -1;
++        }
++        perturb_tables_shared = 1;
+ #else
+         printf("\n");
+         printf("Error: Not compiled with CLASS.\n");
+         printf("You could reconfigure with \"./configure --with-class=/your/class\" and then \n");
+         printf("\"make clean && make\". Alternatively, you could provide a perturbation vector file.\n");
+-        return 1;
++        MPI_Comm_free(&node_comm);
++        cleanParams(pars);
++        return -1;
+ #endif
+     }
+ 
+@@ -146,7 +611,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
+         gauge_Nbody = 1;
+     } else {
+         printf("Error: unknown output gauge '%s'.\n", pars->Gauge);
+-        exit(1);
++        cleanPerturbSpline(&spline);
++        fastdf_clean_perturb_tables(&ptdat, &ptpars, perturb_tables_shared,
++                                    &perturb_window);
++        MPI_Comm_free(&node_comm);
++        cleanParams(pars);
++        return -1;
+     }
+ 
+     /* Check if we recognize the output velocity type */
+@@ -160,7 +630,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
+         velocity_type = 1;
+     } else {
+         printf("Error: unknown output velocity type '%s'.\n", pars->VelocityType);
+-        exit(1);
++        cleanPerturbSpline(&spline);
++        fastdf_clean_perturb_tables(&ptdat, &ptpars, perturb_tables_shared,
++                                    &perturb_window);
++        MPI_Comm_free(&node_comm);
++        cleanParams(pars);
++        return -1;
+     }
+ 
+     if (pars->IncludeHubbleFactors) {
+@@ -183,7 +658,79 @@ long long run_fastdf(struct params *pars, struct units *us) {
+         message(verbosity_low, "\n\n");
+     }
+ 
+-    /* Read the Gaussian random field on each MPI rank */
++    /* Validate every option and perturbation-table lookup before allocating
++     * collective shared-memory resources. No rank may return locally while
++     * peers can still be using the window. */
++    const int grid_interp_order = pars->InterpolationOrder;
++    int validation_status = (grid_interp_order != 1 && grid_interp_order != 2);
++    if (validation_status && rank == 0)
++        printf("Unsupported grid interpolation order (use 1 = NGP or 2 = CIC).\n");
++
++    char *title = pars->TransferFunctionDensity;
++    int index_src = findTitle(ptdat.titles, title, ptdat.n_functions);
++    int index_psi = findTitle(ptdat.titles, "psi", ptdat.n_functions);
++    int index_phi = findTitle(ptdat.titles, "phi", ptdat.n_functions);
++    int index_hdot = -1;
++    int index_etadot = -1;
++    int index_Nbshift = -1;
++    int index_HTNbp = -1;
++    if (gauge_Nbody) {
++        index_hdot = findTitle(ptdat.titles, "h_prime", ptdat.n_functions);
++        index_etadot = findTitle(ptdat.titles, "eta_prime", ptdat.n_functions);
++        index_Nbshift = findTitle(ptdat.titles, "delta_shift_Nb_m", ptdat.n_functions);
++        index_HTNbp = findTitle(ptdat.titles, "H_T_Nb_prime", ptdat.n_functions);
++    }
++    int transfer_status = index_src < 0 || index_psi < 0 || index_phi < 0;
++    transfer_status |= gauge_Nbody &&
++                       (index_hdot < 0 || index_etadot < 0 ||
++                        index_Nbshift < 0 || index_HTNbp < 0);
++    validation_status |= transfer_status;
++
++    int global_status = 0;
++    MPI_Allreduce(&validation_status, &global_status, 1, MPI_INT, MPI_MAX,
++                  MPI_COMM_WORLD);
++    if (global_status != 0) {
++        if (transfer_status && rank == 0)
++            printf("Error: one or more required FastDF transfer functions are unavailable.\n");
++        cleanPerturbSpline(&spline);
++        fastdf_clean_perturb_tables(&ptdat, &ptpars, perturb_tables_shared,
++                                    &perturb_window);
++        MPI_Comm_free(&node_comm);
++        cleanParams(pars);
++        return -1;
++    }
++
++    /* Compute the rank-local particle range early so the HDF5 write limit is
++     * also checked before the shared window is allocated. */
++    long long M = pars->CubeRootNumber;
++    double fac = (double) M / MPI_Rank_Count;
++    long long X_min = ceil(rank * fac);
++    long long X_max = ceil((rank + 1) * fac);
++    long long MX = X_max - X_min;
++    long long localParticleNumber = MX * M * M;
++    long long localFirstNumber = X_min * M * M;
++    long long totalParticlesAssigned = 0;
++    MPI_Allreduce(&localParticleNumber, &totalParticlesAssigned, 1,
++                  MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
++    assert(totalParticlesAssigned == M * M * M);
++
++    validation_status = localParticleNumber * 3 * sizeof(double) > HDF5_PARALLEL_LIMIT;
++    MPI_Allreduce(&validation_status, &global_status, 1, MPI_INT, MPI_MAX,
++                  MPI_COMM_WORLD);
++    if (global_status != 0) {
++        if (rank == 0)
++            printf("Error: exceeding the 2GB limit on parallel HDF5 writes; increase the number of MPI tasks.\n");
++        cleanPerturbSpline(&spline);
++        fastdf_clean_perturb_tables(&ptdat, &ptpars, perturb_tables_shared,
++                                    &perturb_window);
++        MPI_Comm_free(&node_comm);
++        cleanParams(pars);
++        return -1;
++    }
++
++    /* Read the Gaussian random field into a per-node shared-memory window.
++     * All grids are shared among the ranks of a node: node_rank 0 computes or
++     * reads each one once, and every rank reads them for the particle loop. */
+     double *box;
+     double BoxLen = 0;
+     int N;
+@@ -191,9 +738,155 @@ long long run_fastdf(struct params *pars, struct units *us) {
+     header(verbosity_low, "Random phases");
+     message(verbosity_low, "Reading Gaussian random field from %s (dataset %s).\n", pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset);
+ 
+-    readFieldFileDataSet(&box, &N, &BoxLen, pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset);
+-    // readFieldFile(&box, &N, &BoxLen, pars->GaussianRandomFieldFile);
+-    // readFieldFile_MPI(&box, &N, &BoxLen, MPI_COMM_WORLD, pars->GaussianRandomFieldFile);
++    /* Read the grid size + box length on node_rank 0, then synchronize the I/O
++     * status first within the node and then across the whole job. Each node
++     * reads the white-noise file independently, so a failure on one node must
++     * make every rank exit consistently (never using an uninitialized N). */
++    int io_status = 0;
++    if (node_rank == 0)
++        io_status = readFieldHeader(&N, &BoxLen, pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset);
++    MPI_Bcast(&io_status, 1, MPI_INT, 0, node_comm);
++    MPI_Allreduce(&io_status, &global_status, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
++    if (global_status != 0) {
++        printf("Error: could not read the white-noise header (status %d).\n", io_status);
++        cleanPerturbSpline(&spline);
++        fastdf_clean_perturb_tables(&ptdat, &ptpars, perturb_tables_shared,
++                                    &perturb_window);
++        MPI_Comm_free(&node_comm);
++        cleanParams(pars);
++        return -1;
++    }
++    MPI_Bcast(&N, 1, MPI_INT, 0, node_comm);
++    MPI_Bcast(&BoxLen, 1, MPI_DOUBLE, 0, node_comm);
++
++    /* One shared window sized to the *peak* simultaneous footprint rather than
++     * the sum of all grids. Fixed slots: box (1 real) + fbox, fgrf (2 complex).
++     * Scratch slots: 7 real + 2 complex, reused across the three phases because
++     * the phase-1/2/3 grids have disjoint lifetimes.
++     *
++     * Complex grids use the FFTW r2c half layout: an N^3 real grid is stored as
++     * N x N x (N/2 + 1) complex values. real_sz is rounded up to a multiple of
++     * sizeof(fftw_complex) (16 bytes) so every complex grid carved after a run
++     * of real slots stays 16-byte aligned even when N is odd. */
++    size_t n3 = (size_t)N * N * N;
++    size_t nc = (size_t)N * N * (N / 2 + 1);       /* r2c half-complex count */
++    size_t real_sz = n3 * sizeof(double);           /* real grid data size */
++    size_t real_stride = (real_sz + sizeof(fftw_complex) - 1)
++                         & ~((size_t)sizeof(fftw_complex) - 1); /* 16-byte aligned */
++    size_t cplx_sz = nc * sizeof(fftw_complex);     /* already 16-byte aligned */
++    size_t total_sz = 8 * real_stride + 4 * cplx_sz;
++
++    void *sh_base = NULL;
++    MPI_Win sh_win;
++    MPI_Aint local_sz = (node_rank == 0) ? (MPI_Aint)total_sz : 0;
++    mpi_status = MPI_Win_allocate_shared(local_sz, sizeof(double), MPI_INFO_NULL,
++                                         node_comm, &sh_base, &sh_win);
++    int local_mpi_ok = (mpi_status == MPI_SUCCESS);
++    int node_window_valid = 0;
++    MPI_Allreduce(&local_mpi_ok, &node_window_valid, 1, MPI_INT, MPI_MIN, node_comm);
++    int local_failed = !node_window_valid;
++    MPI_Allreduce(&local_failed, &global_status, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
++    if (global_status != 0) {
++        if (mpi_status != MPI_SUCCESS)
++            printf("Error: MPI_Win_allocate_shared failed (status %d).\n", mpi_status);
++        /* Free only on nodes where allocation succeeded collectively. */
++        if (node_window_valid)
++            MPI_Win_free(&sh_win);
++        cleanPerturbSpline(&spline);
++        fastdf_clean_perturb_tables(&ptdat, &ptpars, perturb_tables_shared,
++                                    &perturb_window);
++        MPI_Comm_free(&node_comm);
++        cleanParams(pars);
++        return -1;
++    }
++    MPI_Win_set_errhandler(sh_win, MPI_ERRORS_RETURN);
++    MPI_Aint sh_size; int sh_disp;
++    mpi_status = MPI_Win_shared_query(sh_win, 0, &sh_size, &sh_disp, &sh_base);
++    local_failed = (mpi_status != MPI_SUCCESS);
++    MPI_Allreduce(&local_failed, &global_status, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
++    if (global_status != 0) {
++        if (mpi_status != MPI_SUCCESS)
++            printf("Error: MPI_Win_shared_query failed (status %d).\n", mpi_status);
++        MPI_Win_free(&sh_win);
++        cleanPerturbSpline(&spline);
++        fastdf_clean_perturb_tables(&ptdat, &ptpars, perturb_tables_shared,
++                                    &perturb_window);
++        MPI_Comm_free(&node_comm);
++        cleanParams(pars);
++        return -1;
++    }
++
++    /* Fixed grids (alive throughout) */
++    char *shb = (char *)sh_base;
++    box              = (double *)(shb + 0 * real_stride);
++    fftw_complex *fbox = (fftw_complex *)(shb + 1 * real_stride);
++    fftw_complex *fgrf = (fftw_complex *)(shb + 1 * real_stride + 1 * cplx_sz);
++
++    /* Scratch region (reused across phases) */
++    char *scr = shb + 1 * real_stride + 2 * cplx_sz;
++
++    /* Real grids: box_dic/box_phi0/box_dshift share slot 0;
++     * box_tic/box_phi1/box_tshift share slot 1. */
++    double *box_dic     = (double *)(scr + 0 * real_stride);
++    double *box_tic     = (double *)(scr + 1 * real_stride);
++    double *box_phi0    = (double *)(scr + 0 * real_stride);
++    double *box_phi1    = (double *)(scr + 1 * real_stride);
++    double *box_psi0    = (double *)(scr + 2 * real_stride);
++    double *box_psi1    = (double *)(scr + 3 * real_stride);
++    double *box_phi     = (double *)(scr + 4 * real_stride);
++    double *box_psi     = (double *)(scr + 5 * real_stride);
++    double *box_phi_dot = (double *)(scr + 6 * real_stride);
++    double *box_dshift  = (double *)(scr + 0 * real_stride);
++    double *box_tshift  = (double *)(scr + 1 * real_stride);
++
++    /* Complex grids: fbox_phi/fbox_psi use the tail of the scratch; the phase-3
++     * gauge temporaries overlap the phase-2 real slots (disjoint lifetimes).
++     * Since cplx_sz < 2 * real_stride for N >= 2, each complex temporary fits
++     * within the two real slots it is aliased onto. */
++    fftw_complex *fbox_phi     = (fftw_complex *)(scr + 7 * real_stride);
++    fftw_complex *fbox_psi     = (fftw_complex *)(scr + 7 * real_stride + 1 * cplx_sz);
++    fftw_complex *fbox_hdot    = (fftw_complex *)(scr + 2 * real_stride);
++    fftw_complex *fbox_etadot  = (fftw_complex *)(scr + 4 * real_stride);
++    fftw_complex *fbox_Nbshift = (fftw_complex *)(scr + 6 * real_stride);
++    fftw_complex *fbox_alpha   = (fftw_complex *)(scr + 8 * real_stride);
++    fftw_complex *fbox_HTNbp   = (fftw_complex *)(scr + 2 * real_stride);
++
++    /* Debug-only: every carved grid must lie within the shared window.
++     * fbox_psi reaches the end of the allocated scratch region. */
++    assert((char *)fbox + cplx_sz <= shb + total_sz);
++    assert((char *)fgrf + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_phi + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_psi + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_hdot + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_etadot + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_Nbshift + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_alpha + cplx_sz <= shb + total_sz);
++    assert((char *)fbox_HTNbp + cplx_sz <= shb + total_sz);
++
++    /* node_rank 0 reads the white-noise field into the shared window; the status
++     * is broadcast node-wide and then reduced job-wide so a failure on any node
++     * makes every rank exit consistently. */
++    if (node_rank == 0)
++        io_status = readFieldBody(box, pars->GaussianRandomFieldFile, pars->GaussianRandomFieldDataset, N);
++    MPI_Bcast(&io_status, 1, MPI_INT, 0, node_comm);
++    MPI_Allreduce(&io_status, &global_status, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
++    if (global_status != 0) {
++        printf("Error: could not read the white-noise field (status %d).\n", io_status);
++        MPI_Win_free(&sh_win);
++        cleanPerturbSpline(&spline);
++        fastdf_clean_perturb_tables(&ptdat, &ptpars, perturb_tables_shared,
++                                    &perturb_window);
++        MPI_Comm_free(&node_comm);
++        cleanParams(pars);
++        return -1;
++    }
++    shared_grid_sync(sh_win, node_comm);
++
++    /* x-range and flat-range each node rank fills (block decomposition) */
++    const int x0 = node_rank * N / node_size;
++    const int x1 = (node_rank + 1) * N / node_size;
++    const size_t i0 = (size_t)node_rank * n3 / node_size;
++    const size_t i1 = (size_t)(node_rank + 1) * n3 / node_size;
+ 
+     /* Override the box length? */
+     if (BoxLen > 0.) {
+@@ -207,75 +900,136 @@ long long run_fastdf(struct params *pars, struct units *us) {
+     message(verbosity_low, "GridSize = %d\n", N);
+ 
+     /* The order of grid interpolation to be used in the main loop */
+-    const int grid_interp_order = pars->InterpolationOrder;
+     if (grid_interp_order == 1) {
+         message(verbosity_low, "Interpolation = %s\n", "NGP");
+-    } else if (grid_interp_order == 2) {
+-        message(verbosity_low, "Interpolation = %s\n", "CIC");
+     } else {
+-        printf("Unsupported grid interpolation order (use 1 = NGP or 2 = CIC).\n");
+-        exit(1);
++        message(verbosity_low, "Interpolation = %s\n", "CIC");
+     }
+ 
+-    /* Do we want to invert the field for paired simulations? */
+-    if (pars->InvertField) {
+-        message(verbosity_low, "Inverting input field.\n");
+-        for (int i = 0; i < N * N * N; i++) {
+-            box[i] *= -1.0;
++    /* Invert / normalize the shared white-noise field. Only node_rank 0 writes
++     * it (it is shared, so a single writer avoids races). */
++    if (node_rank == 0) {
++        /* Do we want to invert the field for paired simulations? */
++        if (pars->InvertField) {
++            message(verbosity_low, "Inverting input field.\n");
++            for (int i = 0; i < N * N * N; i++) {
++                box[i] *= -1.0;
++            }
+         }
+-    }
+ 
+-    /* Compute the mean of the input field */
+-    double mean = 0.;
+-    for (int i = 0; i < N * N * N; i++) {
+-        mean += box[i];
+-    }
+-    mean /= (double) (N * N * N);
++        /* Compute the mean of the input field */
++        double mean = 0.;
++        for (int i = 0; i < N * N * N; i++) {
++            mean += box[i];
++        }
++        mean /= (double) (N * N * N);
+ 
+-    /* Compute the variance of the input field */
+-    double var = 0.;
+-    for (int i = 0; i < N * N * N; i++) {
+-        var += (box[i] - mean) * (box[i] - mean);
+-    }
+-    var /= (double) (N * N * N);
++        /* Compute the variance of the input field */
++        double var = 0.;
++        for (int i = 0; i < N * N * N; i++) {
++            var += (box[i] - mean) * (box[i] - mean);
++        }
++        var /= (double) (N * N * N);
+ 
+-    message(verbosity_low, "Mean = %.10g\n", mean);
+-    message(verbosity_low, "Variance = %.10g\n", var);
++        message(verbosity_low, "Mean = %.10g\n", mean);
++        message(verbosity_low, "Variance = %.10g\n", var);
+ 
+-    /* Do we want to normalize the Gaussian field? */
+-    if (pars->NormalizeGaussianField) {
+-        message(verbosity_low, "\nNormalizing the input field.\n");
++        /* Do we want to normalize the Gaussian field? */
++        if (pars->NormalizeGaussianField) {
++            message(verbosity_low, "\nNormalizing the input field.\n");
+ 
+-        /* Set the variance to 1.0, then apply the correct normalization */
+-        const double inv_sdev = 1.0 / sqrt(var);
+-        const double norm = inv_sdev * pow(N / BoxLen, 1.5);
+-        message(verbosity_low, "Normalizing by %g.\n", norm);
++            /* Set the variance to 1.0, then apply the correct normalization */
++            const double inv_sdev = 1.0 / sqrt(var);
++            const double norm = inv_sdev * pow(N / BoxLen, 1.5);
++            message(verbosity_low, "Normalizing by %g.\n", norm);
+ 
+-        for (int i = 0; i < N * N * N; i++) {
+-            box[i] *= norm;
++            for (int i = 0; i < N * N * N; i++) {
++                box[i] *= norm;
++            }
+         }
+-    }
+ 
+-    /* Do we want to correct the Monofonic normalization? */
+-    if (pars->AssumeMonofonicNormalization) {
+-        message(verbosity_low, "\nUndoing the monofonIC normalization.\n");
++        /* Do we want to correct the Monofonic normalization? */
++        if (pars->AssumeMonofonicNormalization) {
++            message(verbosity_low, "\nUndoing the monofonIC normalization.\n");
+ 
+-        /* Apply the correct normalization, relative to monofonIC */
+-        const double norm = pow(h / (2.0 * M_PI), 1.5);
+-        message(verbosity_low, "Normalizing by %g.\n", norm);
++            /* Apply the correct normalization, relative to monofonIC */
++            const double norm = pow(h / (2.0 * M_PI), 1.5);
++            message(verbosity_low, "Normalizing by %g.\n", norm);
+ 
+-        for (int i = 0; i < N * N * N; i++) {
+-            box[i] *= norm;
++            for (int i = 0; i < N * N * N; i++) {
++                box[i] *= norm;
++            }
+         }
+     }
++    shared_grid_sync(sh_win, node_comm);
++
++    /* Build the fixed-buffer FFT plans once and retain them for the complete
++     * FastDF run.  The potential plans are executed repeatedly as the transfer
++     * functions are refreshed. FFTW_ESTIMATE does not overwrite the shared
++     * input arrays while constructing these plans. */
++    enum {
++        FASTDF_PLAN_NOISE_R2C,
++        FASTDF_PLAN_PRE_IC_C2R,
++        FASTDF_PLAN_PHI_C2R,
++        FASTDF_PLAN_PSI_C2R,
++        FASTDF_PLAN_DSHIFT_C2R,
++        FASTDF_PLAN_TSHIFT_C2R,
++        FASTDF_PLAN_COUNT
++    };
++    fftw_plan fft_plans[FASTDF_PLAN_COUNT] = {NULL, NULL, NULL, NULL, NULL, NULL};
++    int fft_plan_failed = 0;
++    if (node_rank == 0) {
++        fft_plans[FASTDF_PLAN_NOISE_R2C] =
++            fftw_plan_dft_r2c_3d(N, N, N, box, fbox, FFTW_ESTIMATE);
++        fft_plans[FASTDF_PLAN_PRE_IC_C2R] =
++            fftw_plan_dft_c2r_3d(N, N, N, fbox, box, FFTW_ESTIMATE);
++        fft_plans[FASTDF_PLAN_PHI_C2R] =
++            fftw_plan_dft_c2r_3d(N, N, N, fbox_phi, box_phi1, FFTW_ESTIMATE);
++        fft_plans[FASTDF_PLAN_PSI_C2R] =
++            fftw_plan_dft_c2r_3d(N, N, N, fbox_psi, box_psi1, FFTW_ESTIMATE);
++        if (gauge_Nbody) {
++            fft_plans[FASTDF_PLAN_DSHIFT_C2R] =
++                fftw_plan_dft_c2r_3d(N, N, N, fbox, box_dshift, FFTW_ESTIMATE);
++            fft_plans[FASTDF_PLAN_TSHIFT_C2R] =
++                fftw_plan_dft_c2r_3d(N, N, N, fbox_HTNbp, box_tshift, FFTW_ESTIMATE);
++        }
++        for (int i = 0; i < FASTDF_PLAN_COUNT; i++) {
++            if (fft_plans[i] == NULL &&
++                (gauge_Nbody ||
++                 (i != FASTDF_PLAN_DSHIFT_C2R && i != FASTDF_PLAN_TSHIFT_C2R))) {
++                fft_plan_failed = 1;
++            }
++        }
++    }
++    MPI_Allreduce(&fft_plan_failed, &global_status, 1, MPI_INT, MPI_MAX,
++                  MPI_COMM_WORLD);
++    if (global_status != 0) {
++        if (rank == 0)
++            printf("Error: could not construct the FastDF FFT plans.\n");
++        if (node_rank == 0) {
++            fastdf_destroy_fft_plans(fft_plans, FASTDF_PLAN_COUNT);
++#ifdef USE_FFTW_THREADS
++            if (fftw_threads_initialized)
++                fftw_plan_with_nthreads(fill_threads);
++#endif
++        }
++        MPI_Win_free(&sh_win);
++        cleanPerturbSpline(&spline);
++        fastdf_clean_perturb_tables(&ptdat, &ptpars, perturb_tables_shared,
++                                    &perturb_window);
++        MPI_Comm_free(&node_comm);
++        cleanParams(pars);
++        return -1;
++    }
++
++    /* Fourier transform the Gaussian random field (node_rank 0 only). */
++    if (node_rank == 0) {
++        fft_execute(fft_plans[FASTDF_PLAN_NOISE_R2C]);
++    }
++    shared_grid_sync(sh_win, node_comm);
+ 
+-    /* Fourier transform the Gaussian random field */
+-    fftw_complex *fbox = malloc(N*N*N*sizeof(fftw_complex));
+-    fftw_complex *fgrf = malloc(N*N*N*sizeof(fftw_complex));
+-    fftw_plan r2c = fftw_plan_dft_r2c_3d(N, N, N, box, fbox, FFTW_ESTIMATE);
+-    fft_execute(r2c);
+-    fft_normalize_r2c(fbox, N, BoxLen);
+-    fftw_destroy_plan(r2c);
++    /* Normalize the Fourier field (block-decomposed across node ranks) */
++    fft_normalize_r2c(fbox, N, BoxLen, x0, x1);
+ 
+     /* Do we need to apply the primordial power spectrum? */
+     if (pars->NormalizeGaussianField || pars->AssumeMonofonicNormalization) {
+@@ -294,35 +1048,12 @@ long long run_fastdf(struct params *pars, struct units *us) {
+         message(verbosity_low, "beta_s = %.5g\n", ps.beta_s);
+ 
+         /* Apply the bare power spectrum to fbox */
+-        fft_apply_kernel(fbox, fbox, N, BoxLen, kernel_power_no_transfer, &ps);
++        fft_apply_kernel(fbox, fbox, N, BoxLen, kernel_power_no_transfer, &ps, x0, x1);
+     }
+ 
+-    /* Make a copy of the complex Gaussian random field */
+-    memcpy(fgrf, fbox, N*N*N*sizeof(fftw_complex));
+-
+-    /* Find the relevant density title among the transfer functions */
+-    char *title = pars->TransferFunctionDensity;
+-    int index_src = findTitle(ptdat.titles, title, ptdat.n_functions);
+-    if (index_src < 0) {
+-        printf("Error: transfer function '%s' not found (%d).\n", title, index_src);
+-        return 1;
+-    }
+-
+-    /* If we are outputting in N-body gauge, check that all the necessary
+-     * transfer functions are there before doing the integrtion. */
+-    if (gauge_Nbody) {
+-        /* The indices of the necessary transfer function */
+-        int index_hdot = findTitle(ptdat.titles, "h_prime", ptdat.n_functions);
+-        int index_etadot = findTitle(ptdat.titles, "eta_prime", ptdat.n_functions);
+-        int index_Nbshift = findTitle(ptdat.titles, "delta_shift_Nb_m", ptdat.n_functions);
+-        int index_ncdm = findTitle(ptdat.titles, title, ptdat.n_functions);
+-        int index_HTNbp = findTitle(ptdat.titles, "H_T_Nb_prime", ptdat.n_functions);
+-        if (index_hdot < 0 || index_etadot < 0 || index_Nbshift < 0 ||
+-            index_ncdm < 0 || index_HTNbp < 0) {
+-            printf("Error: required transfer function not found (%d, %d, %d, %d, %d).\n", index_hdot, index_etadot, index_Nbshift, index_ncdm, index_HTNbp);
+-            return 1;
+-        }
+-    }
++    /* Make a copy of the complex Gaussian random field (block-decomposed) */
++    memcpy(fgrf + (size_t)x0 * N * (N/2 + 1), fbox + (size_t)x0 * N * (N/2 + 1),
++           (size_t)(x1 - x0) * N * (N/2 + 1) * sizeof(fftw_complex));
+ 
+     /* The index of the present day, corresponds to the last index in the array */
+     int today_index = ptdat.tau_size - 1;
+@@ -343,34 +1074,33 @@ long long run_fastdf(struct params *pars, struct units *us) {
+     /* Determine the number of particle to be generated on each rank */
+     header(verbosity_low, "Particle distribution");
+ 
+-    /* The particle number is M^3 */
+-    long long M = pars->CubeRootNumber;
+-
+-    /* Determine what particles belong to this slice */
+-    double fac = (double) M / MPI_Rank_Count;
+-    long long X_min = ceil(rank * fac);
+-    long long X_max = ceil((rank + 1) * fac);
+-    long long MX = X_max - X_min;
+-    long long localParticleNumber = MX * M * M;
+-    long long localFirstNumber = X_min * M * M;
+-
+-    /* Check that all particles have been assigned to a node */
+-    long long totalParticlesAssigned;
+-    MPI_Allreduce(&localParticleNumber, &totalParticlesAssigned, 1,
+-                   MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+-    assert(totalParticlesAssigned == M * M * M);
+     if (verbosity)
+     printf("%03d: Local particles [%04lld, %04lld], first = %lld, last = %lld, total = %lld\n", rank, X_min, X_max, localFirstNumber, localFirstNumber + localParticleNumber - 1, totalParticlesAssigned);
+ 
+-    /* Check that we are not exceeding the HDF5 parallel write limit */
+-    if (localParticleNumber * 3 * sizeof(double) > HDF5_PARALLEL_LIMIT) {
+-        printf("\nError: Exceeding 2GB limit on parallel HDF5 writes. Increase the number of MPI tasks.\n");
+-        exit(1);
+-    }
+-
+     /* The particles to be generated on this node */
+     struct particle_ext *genparts = calloc(localParticleNumber,
+                                            sizeof(struct particle_ext));
++    int particle_allocation_failed = localParticleNumber > 0 && genparts == NULL;
++    MPI_Allreduce(&particle_allocation_failed, &global_status, 1, MPI_INT,
++                  MPI_MAX, MPI_COMM_WORLD);
++    if (global_status != 0) {
++        if (rank == 0) printf("Error: could not allocate the FastDF particle array.\n");
++        free(genparts);
++        if (node_rank == 0) {
++            fastdf_destroy_fft_plans(fft_plans, FASTDF_PLAN_COUNT);
++#ifdef USE_FFTW_THREADS
++            if (fftw_threads_initialized)
++                fftw_plan_with_nthreads(fill_threads);
++#endif
++        }
++        MPI_Win_free(&sh_win);
++        cleanPerturbSpline(&spline);
++        fastdf_clean_perturb_tables(&ptdat, &ptpars, perturb_tables_shared,
++                                    &perturb_window);
++        MPI_Comm_free(&node_comm);
++        cleanParams(pars);
++        return -1;
++    }
+ 
+     /* ID of the first particle on this node */
+     long long firstID = pars->FirstID + localFirstNumber;
+@@ -380,10 +1110,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+     double z_begin = 1./a_begin - 1;
+     double log_tau_begin = perturbLogTauAtRedshift(&spline, z_begin);
+ 
+-    /* Allocate boxes for the initial conditions */
+-    double *box_dic = malloc(N*N*N*sizeof(double));
+-    double *box_tic = malloc(N*N*N*sizeof(double));
+-
++    /* (box_dic, box_tic are already carved from the shared window) */
+ 
+     header(verbosity_low, "Generating pre-initial conditions");
+     message(verbosity_low, "Generating pre-initial grids.\n");
+@@ -394,35 +1121,40 @@ long long run_fastdf(struct params *pars, struct units *us) {
+         double u_tau; //spacing between subsequent bins
+         perturbSplineFindTau(&spline, log_tau_begin, &tau_index, &u_tau);
+ 
+-        /* The indices of the potential transfer function */
+-        int index_psi = findTitle(ptdat.titles, "psi", ptdat.n_functions);
+-        if (index_psi < 0) {
+-            printf("Error: transfer function '%s' not found (%d).\n", "psi", index_psi);
+-            return 1;
+-        }
+-
+         /* Package the perturbation theory interpolation spline parameters */
+         struct spline_params sp = {&spline, index_psi, tau_index, u_tau};
+ 
+         /* Apply the transfer function (read only fgrf, output into fbox) */
+-        fft_apply_kernel(fbox, fgrf, N, BoxLen, kernel_transfer_function, &sp);
++        fft_apply_kernel(fbox, fgrf, N, BoxLen, kernel_transfer_function, &sp, x0, x1);
++
++        /* Fourier transform to real space (node_rank 0 only) */
++        shared_grid_sync(sh_win, node_comm);
++        if (node_rank == 0) {
++            fft_execute(fft_plans[FASTDF_PLAN_PRE_IC_C2R]);
++        }
++        shared_grid_sync(sh_win, node_comm);
+ 
+-        /* Fourier transform to real space */
+-        fftw_plan c2r = fftw_plan_dft_c2r_3d(N, N, N, fbox, box, FFTW_ESTIMATE);
+-        fft_execute(c2r);
+-        fft_normalize_c2r(box, N, BoxLen);
+-        fftw_destroy_plan(c2r);
++        fft_normalize_c2r(box, N, BoxLen, x0, x1);
+ 
+-        /* Copy into the boxes for the density and velocity perturbations */
+-        memcpy(box_dic, box, N*N*N*sizeof(double));
+-        memcpy(box_tic, box, N*N*N*sizeof(double));
++        /* Copy into the boxes for the density and velocity perturbations.
++         * Use the same x-slice decomposition as fft_normalize_c2r above (flat
++         * range j0..j1 == x-slice x0..x1) so that each rank copies exactly the
++         * x-planes it normalized. Using a separate flat i0..i1 split would be
++         * inconsistent with the x-slice when node_size > N and would let a rank
++         * read x-planes normalized by another rank without synchronization. */
++        const size_t j0 = (size_t)x0 * N * N;
++        const size_t j1 = (size_t)x1 * N * N;
++        memcpy(box_dic + j0, box + j0, (j1 - j0) * sizeof(double));
++        memcpy(box_tic + j0, box + j0, (j1 - j0) * sizeof(double));
+ 
+         /* Multiply by the appropriate factor */
+-        for (int i=0; i<N*N*N; i++) {
++        for (size_t i = j0; i < j1; i++) {
+             box_dic[i] *= -2 * inv_c2;
+             box_tic[i] *= 0.5 * exp(log_tau_begin);
+         }
+ 
++        shared_grid_sync(sh_win, node_comm);
++
+         if (rank == 0 && pars->OutputFields) {
+             char dnu_fname[50];
+             sprintf(dnu_fname, "%s/ic_dnu.hdf5", pars->OutputDirectory);
+@@ -488,9 +1220,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+         p->v_i_mag = hypot3(p->v[0], p->v[1], p->v[2]);
+     }
+ 
+-    /* Free the boxes used for the initial conditions */
+-    free(box_dic);
+-    free(box_tic);
++    /* (box_dic, box_tic are shared and released with the window at the end) */
+ 
+     message(verbosity_low, "Done with pre-initial conditions.\n");
+ 
+@@ -522,23 +1252,8 @@ long long run_fastdf(struct params *pars, struct units *us) {
+ 
+     message(verbosity_high, "     ITER a         z         I            recompute\n");
+ 
+-    /* Allocate grids for the potentials (phi and psi) at two different times
+-     * t0 <= t < t1. We will evaluate at time t using linear interpolation. */
+-    double *box_phi0 = malloc(N*N*N*sizeof(double));
+-    double *box_phi1 = malloc(N*N*N*sizeof(double));
+-    double *box_psi0 = malloc(N*N*N*sizeof(double));
+-    double *box_psi1 = malloc(N*N*N*sizeof(double));
+-
+-    /* The interpolated grids at time t */
+-    double *box_phi = malloc(N*N*N*sizeof(double));
+-    double *box_psi = malloc(N*N*N*sizeof(double));
+-
+-    /* Time derivative at time t */
+-    double *box_phi_dot = malloc(N*N*N*sizeof(double));
+-
+-    /* Complex grids that will be used */
+-    fftw_complex *fbox_phi = malloc(N*N*N*sizeof(fftw_complex));
+-    fftw_complex *fbox_psi = malloc(N*N*N*sizeof(fftw_complex));
++    /* (box_phi0/1, box_psi0/1, box_phi, box_psi, box_phi_dot, fbox_phi, fbox_psi
++     * are already carved from the shared window) */
+ 
+     /* Transer functions evaluated at a reference scale during the last update */
+     double Tk_phi = 0.0;
+@@ -598,14 +1313,6 @@ long long run_fastdf(struct params *pars, struct units *us) {
+         /* A flag indicating whether we recomputed the potentials in this step */
+         int recompute = 0;
+ 
+-        /* The inddices of the potential transfer functions psi and phi */
+-        int index_psi = findTitle(ptdat.titles, "psi", ptdat.n_functions);
+-        int index_phi = findTitle(ptdat.titles, "phi", ptdat.n_functions);
+-        if (index_psi < 0 || index_phi < 0) {
+-            printf("Error: transfer function '%s' or '%s' not found (%d, %d).\n", "psi", "phi", index_psi, index_phi);
+-            return 1;
+-        }
+-
+         /* Evaluate the transfer functions at the reference scale */
+         double Tk_phi_curr = perturbSplineInterp(&spline, k_ref_index, tau_idx_curr, u_ref_k, u_curr, index_phi);
+         double Tk_psi_curr = perturbSplineInterp(&spline, k_ref_index, tau_idx_curr, u_ref_k, u_curr, index_psi);
+@@ -660,7 +1367,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+             Tk_psi = Tk_psi_curr;
+ 
+             /* Copy the current boxes at t=t1 to the slots for t=t0 */
+-            if (ITER > 0) {
++            if (node_rank == 0 && ITER > 0) {
+                 memcpy(box_phi0, box_phi1, N*N*N*sizeof(double));
+                 memcpy(box_psi0, box_psi1, N*N*N*sizeof(double));
+             }
+@@ -672,19 +1379,22 @@ long long run_fastdf(struct params *pars, struct units *us) {
+             struct spline_params sp_psi_curr = {&spline, index_psi, tau_idx_major_next, u_major_next};
+ 
+             /* Apply the transfer function (read only fgrf, output into fbox) */
+-            fft_apply_kernel(fbox_phi, fgrf, N, BoxLen, kernel_transfer_function, &sp_phi_curr);
+-            fft_apply_kernel(fbox_psi, fgrf, N, BoxLen, kernel_transfer_function, &sp_psi_curr);
+-
+-            /* Fourier transform to real space */
+-            fftw_plan c2r = fftw_plan_dft_c2r_3d(N, N, N, fbox_phi, box_phi1, FFTW_ESTIMATE);
+-            fft_execute(c2r);
+-            fft_normalize_c2r(box_phi1, N, BoxLen);
+-            fftw_destroy_plan(c2r);
+-
+-            fftw_plan c2r2 = fftw_plan_dft_c2r_3d(N, N, N, fbox_psi, box_psi1, FFTW_ESTIMATE);
+-            fft_execute(c2r2);
+-            fft_normalize_c2r(box_psi1, N, BoxLen);
+-            fftw_destroy_plan(c2r2);
++            fft_apply_kernel(fbox_phi, fgrf, N, BoxLen, kernel_transfer_function, &sp_phi_curr, x0, x1);
++            fft_apply_kernel(fbox_psi, fgrf, N, BoxLen, kernel_transfer_function, &sp_psi_curr, x0, x1);
++
++            /* Fourier transform to real space (node_rank 0 only) */
++            shared_grid_sync(sh_win, node_comm);
++            if (node_rank == 0) {
++                fft_execute(fft_plans[FASTDF_PLAN_PHI_C2R]);
++                fft_execute(fft_plans[FASTDF_PLAN_PSI_C2R]);
++            }
++            shared_grid_sync(sh_win, node_comm);
++
++            /* The FFT leader has finished writing both grids. Normalize them
++             * using the same node-rank x-slices as the other grid operations. */
++            fft_normalize_c2r(box_phi1, N, BoxLen, x0, x1);
++            fft_normalize_c2r(box_psi1, N, BoxLen, x0, x1);
++            shared_grid_sync(sh_win, node_comm);
+         }
+ 
+         /* Skip the particle integration during the first step */
+@@ -693,17 +1403,19 @@ long long run_fastdf(struct params *pars, struct units *us) {
+ 
+         /* Linearly interpolate the potentials to the current time step */
+         double o = (log_tau - log_tau_major_prev) / (log_tau_major_next - log_tau_major_prev);
+-        for (int i=0; i<N*N*N; i++) {
++        for (size_t i = i0; i < i1; i++) {
+             box_phi[i] = o * box_phi1[i] + (1.0 - o) * box_phi0[i];
+             box_psi[i] = o * box_psi1[i] + (1.0 - o) * box_psi0[i];
+         }
+ 
+         /* Compute the potential derivative grid */
+         double inv_delta_tau = 1.0 / (exp(log_tau_major_next) - exp(log_tau_major_prev));
+-        for (int i=0; i<N*N*N; i++) {
++        for (size_t i = i0; i < i1; i++) {
+             box_phi_dot[i] = (box_phi1[i] - box_phi0[i]) * inv_delta_tau;
+         }
+ 
++        shared_grid_sync(sh_win, node_comm);
++
+         if (rank == 0 && ((pars->OutputFields > 1 && recompute) || (pars->OutputFields > 2 && ITER % 10 == 0))) {
+             char psi_fname[50];
+             sprintf(psi_fname, "%s/psi_%d.hdf5", pars->OutputDirectory, ITER);
+@@ -806,13 +1518,15 @@ long long run_fastdf(struct params *pars, struct units *us) {
+             p->x[1] += p->v[1] * drift * dtau;
+             p->x[2] += p->v[2] * drift * dtau;
+         }
++        shared_grid_sync(sh_win, node_comm);
+ 
+         /* Linearly interpolate the potentials to the half-time step */
+         double o2 = (log_tau_half - log_tau_major_prev) / (log_tau_major_next - log_tau_major_prev);
+-        for (int i=0; i<N*N*N; i++) {
++        for (size_t i = i0; i < i1; i++) {
+             box_phi[i] = o2 * box_phi1[i] + (1.0 - o2) * box_phi0[i];
+             box_psi[i] = o2 * box_psi1[i] + (1.0 - o2) * box_psi0[i];
+         }
++        shared_grid_sync(sh_win, node_comm);
+ 
+         /* Integrate the particles during the second half-step */
+         #pragma omp parallel for
+@@ -881,6 +1595,7 @@ long long run_fastdf(struct params *pars, struct units *us) {
+             p->v[1] += q_vec[1] * phi_dot_c2 * dtau2;
+             p->v[2] += q_vec[2] * phi_dot_c2 * dtau2;
+         }
++        shared_grid_sync(sh_win, node_comm);
+ 
+         /* Step forward */
+         a = a_next;
+@@ -911,22 +1626,11 @@ long long run_fastdf(struct params *pars, struct units *us) {
+         }
+     }
+ 
+-    /* Free grids that are no longer needed */
+-    free(fbox_phi);
+-    free(fbox_psi);
+-    free(box_phi);
+-    free(box_psi);
+-    free(box_phi0);
+-    free(box_phi1);
+-    free(box_psi0);
+-    free(box_psi1);
+-    free(box_phi_dot);
++    /* (phase-2 grids are shared and released with the window at the end) */
+ 
+     if (gauge_Nbody) {
+ 
+-        /* Allocate boxes for the (density and flux) gauge transformations */
+-        double *box_dshift = malloc(N*N*N*sizeof(double));
+-        double *box_tshift = malloc(N*N*N*sizeof(double));
++        /* (box_dshift, box_tshift are already carved from the shared window) */
+ 
+         header(verbosity_low, "Generating N-body gauge transformation grid");
+ 
+@@ -954,51 +1658,31 @@ long long run_fastdf(struct params *pars, struct units *us) {
+             double u_tau; //spacing between subsequent bins
+             perturbSplineFindTau(&spline, log_tau_end, &tau_index, &u_tau);
+ 
+-            /* The indices of the necessary transfer function */
+-            int index_hdot = findTitle(ptdat.titles, "h_prime", ptdat.n_functions);
+-            int index_etadot = findTitle(ptdat.titles, "eta_prime", ptdat.n_functions);
+-            int index_Nbshift = findTitle(ptdat.titles, "delta_shift_Nb_m", ptdat.n_functions);
+-            int index_ncdm = findTitle(ptdat.titles, title, ptdat.n_functions);
+-            int index_HTNbp = findTitle(ptdat.titles, "H_T_Nb_prime", ptdat.n_functions);
+-            if (index_hdot < 0 || index_etadot < 0 || index_Nbshift < 0 ||
+-                index_ncdm < 0 || index_HTNbp < 0) {
+-                printf("Error: required transfer function not found (%d, %d, %d, %d, %d).\n", index_hdot, index_etadot, index_Nbshift, index_ncdm, index_HTNbp);
+-                return 1;
+-            }
+-
+             /* Package the perturbation theory interpolation spline parameters */
+             struct spline_params sp_hdot = {&spline, index_hdot, tau_index, u_tau};
+             struct spline_params sp_etadot = {&spline, index_etadot, tau_index, u_tau};
+             struct spline_params sp_Nbshift = {&spline, index_Nbshift, tau_index, u_tau};
+             struct spline_params sp_HTNbp = {&spline, index_HTNbp, tau_index, u_tau};
+ 
+-            /* Allocate boxes for the complex terms needed for the gauge transformation */
+-            fftw_complex *fbox_alpha = malloc(N*N*N*sizeof(fftw_complex));
+-            fftw_complex *fbox_hdot = malloc(N*N*N*sizeof(fftw_complex));
+-            fftw_complex *fbox_etadot = malloc(N*N*N*sizeof(fftw_complex));
+-            fftw_complex *fbox_Nbshift = malloc(N*N*N*sizeof(fftw_complex));
++            /* (fbox_alpha/hdot/etadot/Nbshift are carved from the shared window) */
+ 
+             /* Apply the transfer function (read only fgrf, output into fbox) */
+-            fft_apply_kernel(fbox_hdot, fgrf, N, BoxLen, kernel_transfer_function, &sp_hdot);
+-            fft_apply_kernel(fbox_etadot, fgrf, N, BoxLen, kernel_transfer_function, &sp_etadot);
+-            fft_apply_kernel(fbox_Nbshift, fgrf, N, BoxLen, kernel_transfer_function, &sp_Nbshift);
++            fft_apply_kernel(fbox_hdot, fgrf, N, BoxLen, kernel_transfer_function, &sp_hdot, x0, x1);
++            fft_apply_kernel(fbox_etadot, fgrf, N, BoxLen, kernel_transfer_function, &sp_etadot, x0, x1);
++            fft_apply_kernel(fbox_Nbshift, fgrf, N, BoxLen, kernel_transfer_function, &sp_Nbshift, x0, x1);
+ 
+             /* Compute alpha * k^2 = h_dot + 6 * eta_dot */
+-            for (int i=0; i<N*N*(N/2+1); i++) {
++            for (int i = x0 * N * (N/2 + 1); i < x1 * N * (N/2 + 1); i++) {
+                 fbox_alpha[i] = fbox_hdot[i] + 6.0 * fbox_etadot[i];
+             }
+ 
+             /* Apply the inverse Poisson kernel -1/k^2 */
+-            fft_apply_kernel(fbox_alpha, fbox_alpha, N, BoxLen, kernel_inv_poisson, NULL);
+-
+-            /* Free grids that are no longer needed */
+-            free(fbox_hdot);
+-            free(fbox_etadot);
++            fft_apply_kernel(fbox_alpha, fbox_alpha, N, BoxLen, kernel_inv_poisson, NULL, x0, x1);
+ 
+             /* Compute the conformal time derivative of the background density */
+-            double Omega_nu = perturbDensityAtLogTau(&spline, log_tau_end, index_ncdm);
+-            double Omega_nu_min = perturbDensityAtLogTau(&spline, log_tau_min, index_ncdm);
+-            double Omega_nu_plus = perturbDensityAtLogTau(&spline, log_tau_plus, index_ncdm);
++            double Omega_nu = perturbDensityAtLogTau(&spline, log_tau_end, index_src);
++            double Omega_nu_min = perturbDensityAtLogTau(&spline, log_tau_min, index_src);
++            double Omega_nu_plus = perturbDensityAtLogTau(&spline, log_tau_plus, index_src);
+ 
+             double H = perturbHubbleAtLogTau(&spline, log_tau_end);
+             double H_min = perturbHubbleAtLogTau(&spline, log_tau_min);
+@@ -1018,19 +1702,18 @@ long long run_fastdf(struct params *pars, struct units *us) {
+             double rho_dot_rho_c4 = rho_dot_rho / (c * c * c * c);
+ 
+             /* Compute the total density gauge shift */
+-            for (int i=0; i<N*N*N; i++) {
++            for (int i = x0 * N * (N/2 + 1); i < x1 * N * (N/2 + 1); i++) {
+                 fbox[i] = -0.5 * fbox_alpha[i] * rho_dot_rho_c4 - (1.0 + w_ncdm) * fbox_Nbshift[i];
+             }
+ 
+-            /* Free grids that are no longer needed */
+-            free(fbox_alpha);
+-            free(fbox_Nbshift);
+-
+-            /* Fourier transform to real space */
+-            fftw_plan c2r = fftw_plan_dft_c2r_3d(N, N, N, fbox, box_dshift, FFTW_ESTIMATE);
+-            fft_execute(c2r);
+-            fft_normalize_c2r(box_dshift, N, BoxLen);
+-            fftw_destroy_plan(c2r);
++            /* Fourier transform to real space (node_rank 0 only) */
++            shared_grid_sync(sh_win, node_comm);
++            if (node_rank == 0) {
++                fft_execute(fft_plans[FASTDF_PLAN_DSHIFT_C2R]);
++            }
++            shared_grid_sync(sh_win, node_comm);
++            fft_normalize_c2r(box_dshift, N, BoxLen, x0, x1);
++            shared_grid_sync(sh_win, node_comm);
+ 
+             if (rank == 0 && pars->OutputFields) {
+                 char density_fname[50];
+@@ -1038,29 +1721,28 @@ long long run_fastdf(struct params *pars, struct units *us) {
+                 writeFieldFile(box_dshift, N, BoxLen, density_fname);
+             }
+ 
+-            /* Allocate new complex grid */
+-            fftw_complex *fbox_HTNbp = malloc(N*N*N*sizeof(fftw_complex));
++            /* (fbox_HTNbp is carved from the shared window) */
+ 
+             /* Apply the transfer function for H_T_Nb_prime */
+-            fft_apply_kernel(fbox_HTNbp, fgrf, N, BoxLen, kernel_transfer_function, &sp_HTNbp);
++            fft_apply_kernel(fbox_HTNbp, fgrf, N, BoxLen, kernel_transfer_function, &sp_HTNbp, x0, x1);
+ 
+             /* Apply the inverse Poisson kernel -1/k^2 */
+-            fft_apply_kernel(fbox_HTNbp, fbox_HTNbp, N, BoxLen, kernel_inv_poisson, NULL);
++            fft_apply_kernel(fbox_HTNbp, fbox_HTNbp, N, BoxLen, kernel_inv_poisson, NULL, x0, x1);
+ 
+-            /* Fourier transform to real space */
+-            fftw_plan c2r3 = fftw_plan_dft_c2r_3d(N, N, N, fbox_HTNbp, box_tshift, FFTW_ESTIMATE);
+-            fft_execute(c2r3);
+-            fft_normalize_c2r(box_tshift, N, BoxLen);
+-            fftw_destroy_plan(c2r3);
++            /* Fourier transform to real space (node_rank 0 only) */
++            shared_grid_sync(sh_win, node_comm);
++            if (node_rank == 0) {
++                fft_execute(fft_plans[FASTDF_PLAN_TSHIFT_C2R]);
++            }
++            shared_grid_sync(sh_win, node_comm);
++            fft_normalize_c2r(box_tshift, N, BoxLen, x0, x1);
++            shared_grid_sync(sh_win, node_comm);
+ 
+             if (rank == 0 && pars->OutputFields) {
+                 char vshift_fname[50];
+                 sprintf(vshift_fname, "%s/gauge_vshift.hdf5", pars->OutputDirectory);
+                 writeFieldFile(box_tshift, N, BoxLen, vshift_fname);
+             }
+-
+-            /* Free the remaining complex grid */
+-            free(fbox_HTNbp);
+         }
+ 
+         message(verbosity_low, "Applying N-body gauge transformation to the particles.\n");
+@@ -1095,41 +1777,59 @@ long long run_fastdf(struct params *pars, struct units *us) {
+             p->v[2] += vel[2] * inv_c * eps_eV * a_end;
+         }
+ 
+-        /* Free the gauge transformation boxes */
+-        free(box_dshift);
+-        free(box_tshift);
++        /* (box_dshift, box_tshift are shared and released with the window) */
+     }
+ 
+-    /* Free memory */
+-    free(box);
+-    free(fgrf);
+-    free(fbox);
+-
+-    /* Compute energies, masses, and weights and store them in contiguous arrays */
+-    double *energies = malloc(1 * localParticleNumber * sizeof(double));
+-    double *masses = malloc(1 * localParticleNumber * sizeof(double));
+-    double *weights = malloc(1 * localParticleNumber * sizeof(double));
+-    double *phaseDensities = malloc(1 * localParticleNumber * sizeof(double));
+-    for (long long i=0; i<localParticleNumber; i++) {
+-        struct particle_ext *p = &genparts[i];
++    /* Plans retain pointers into the shared window and must be destroyed
++     * before that window is released. Restore the rank-local FFTW planning
++     * thread count for any plans the embedding application creates later. */
++    if (node_rank == 0) {
++        fastdf_destroy_fft_plans(fft_plans, FASTDF_PLAN_COUNT);
++#ifdef USE_FFTW_THREADS
++        if (fftw_threads_initialized)
++            fftw_plan_with_nthreads(fill_threads);
++#endif
++    }
+ 
+-        /* Compute the energy & weight (needs to happen before converting the velocities!)*/
+-        double p_eV = fermi_dirac_momentum(p->v, m_eV, us->SpeedOfLight);
+-        double eps_eV = hypot(p_eV/a_end, m_eV);
+-        double eps = particle_mass / m_eV * eps_eV;
+-        double f = fermi_dirac_density(p_eV, T_eV);
+-        double w = (p->f_i - f)/p->f_i;
+-        // p->mass = particle_mass * w;
++    /* The transfer tables and interpolation state are no longer needed after
++     * particle generation. Release both shared windows before their node-local
++     * communicator. */
++    cleanPerturbSpline(&spline);
++    fastdf_clean_perturb_tables(&ptdat, &ptpars, perturb_tables_shared,
++                                &perturb_window);
++    MPI_Win_free(&sh_win);
++    MPI_Comm_free(&node_comm);
+ 
+-        energies[i] = eps;
+-        masses[i] = particle_mass;
+-        weights[i] = w;
+-        phaseDensities[i] = p->f_i;
++    /* Compute energies, masses, and weights and store them in contiguous arrays */
++    double *energies = NULL;
++    double *masses = NULL;
++    double *weights = NULL;
++    double *phaseDensities = NULL;
++    if (pars->ParticleSink == NULL) {
++        energies = malloc(1 * localParticleNumber * sizeof(double));
++        masses = malloc(1 * localParticleNumber * sizeof(double));
++        weights = malloc(1 * localParticleNumber * sizeof(double));
++        phaseDensities = malloc(1 * localParticleNumber * sizeof(double));
++        for (long long i=0; i<localParticleNumber; i++) {
++            struct particle_ext *p = &genparts[i];
+ 
+-        /* Include Hubble factors for Gadget ICs? */
+-        if (pars->IncludeHubbleFactors) {
+-            energies[i] *= h;
+-            masses[i] *= h;
++            /* Compute the energy & weight (needs to happen before converting the velocities!)*/
++            double p_eV = fermi_dirac_momentum(p->v, m_eV, us->SpeedOfLight);
++            double eps_eV = hypot(p_eV/a_end, m_eV);
++            double eps = particle_mass / m_eV * eps_eV;
++            double f = fermi_dirac_density(p_eV, T_eV);
++            double w = (p->f_i - f)/p->f_i;
++
++            energies[i] = eps;
++            masses[i] = particle_mass;
++            weights[i] = w;
++            phaseDensities[i] = p->f_i;
++
++            /* Include Hubble factors for Gadget ICs? */
++            if (pars->IncludeHubbleFactors) {
++                energies[i] *= h;
++                masses[i] *= h;
++            }
+         }
+     }
+ 
+@@ -1168,6 +1868,29 @@ long long run_fastdf(struct params *pars, struct units *us) {
+         }
+     }
+ 
++    if (pars->ParticleSink != NULL) {
++        const void *positions = localParticleNumber > 0 ? (const void *)&genparts[0].x[0] : NULL;
++        const void *velocities = localParticleNumber > 0 ? (const void *)&genparts[0].v[0] : NULL;
++        const void *phase_space_densities = localParticleNumber > 0 ? (const void *)&genparts[0].f_i : NULL;
++        const double output_mass = particle_mass * (pars->IncludeHubbleFactors ? h : 1.0);
++        int sink_status = pars->ParticleSink(pars->ParticleSinkContext,
++                                             positions, sizeof(struct particle_ext),
++                                             velocities, sizeof(struct particle_ext),
++                                             phase_space_densities, sizeof(struct particle_ext),
++                                             (unsigned long long)localParticleNumber,
++                                             (unsigned long long)firstID,
++                                             output_mass, m_eV, T_eV);
++        int global_sink_status = sink_status;
++        MPI_Allreduce(&sink_status, &global_sink_status, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
++
++        free(genparts);
++        MPI_Barrier(MPI_COMM_WORLD);
++        cleanParams(pars);
++        if (global_sink_status != 0)
++            return -1;
++        return localParticleNumber;
++    }
++
+     header(verbosity_high, "Prepare neutrino output");
+ 
+     if (rank == 0 || pars->DistributedFiles) {
+@@ -1209,17 +1932,22 @@ long long run_fastdf(struct params *pars, struct units *us) {
+ 
+         /* Set chunking for vectors */
+         hid_t h_prop_vec = H5Pcreate(H5P_DATASET_CREATE);
+-        const hsize_t vchunk[2] = {HDF5_CHUNK_SIZE, 3};
++        H5Pset_obj_track_times(h_prop_vec, 0);
++        const hsize_t vchunk[2] = {parts_in_file < HDF5_CHUNK_SIZE ? parts_in_file : HDF5_CHUNK_SIZE, 3};
+         H5Pset_chunk(h_prop_vec, vrank, vchunk);
+ 
+         /* Set chunking for scalars */
+         hid_t h_prop_sca = H5Pcreate(H5P_DATASET_CREATE);
+-        const hsize_t schunk[1] = {HDF5_CHUNK_SIZE};
++        H5Pset_obj_track_times(h_prop_sca, 0);
++        const hsize_t schunk[1] = {parts_in_file < HDF5_CHUNK_SIZE ? parts_in_file : HDF5_CHUNK_SIZE};
+         H5Pset_chunk(h_prop_sca, srank, schunk);
+ 
+         /* Create the particle group in the output file */
+         message(verbosity_low, "Creating Group '%s' with %lld particles.\n", ExportName, pars->NumPartGenerate);
+-        h_grp = H5Gcreate(h_out_file, ExportName, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
++        hid_t h_prop_grp = H5Pcreate(H5P_GROUP_CREATE);
++        H5Pset_obj_track_times(h_prop_grp, 0);
++        h_grp = H5Gcreate(h_out_file, ExportName, H5P_DEFAULT, h_prop_grp, H5P_DEFAULT);
++        H5Pclose(h_prop_grp);
+ 
+         /* Coordinates (use vector space) */
+         h_data = H5Dcreate(h_grp, "Coordinates", H5T_NATIVE_DOUBLE, h_vspace, H5P_DEFAULT, h_prop_vec, H5P_DEFAULT);
+@@ -1398,11 +2126,6 @@ long long run_fastdf(struct params *pars, struct units *us) {
+ 
+     /* Clean up */
+     cleanParams(pars);
+-    cleanPerturb(&ptdat);
+-    cleanPerturbParams(&ptpars);
+-
+-    /* Release the interpolation splines */
+-    cleanPerturbSpline(&spline);
+     
+     return localParticleNumber;
+ }

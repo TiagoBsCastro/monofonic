@@ -1,11 +1,32 @@
+/*
+ * This file is part of monofonIC (MUSIC2), a software package for generating
+ * initial conditions for cosmological simulations.
+ * Copyright (C) 2026 monofonIC contributors
+ *
+ * monofonIC is free software: you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option)
+ * any later version.
+ *
+ * monofonIC is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with monofonIC. If not, see <http://www.gnu.org/licenses/>.
+ */
+
 /* End-to-end check that a FastDF white-noise input failure is reported as a
  * negative return value (which monofonIC's ic_generator.cc turns into a thrown
  * std::runtime_error). run_fastdf() must return < 0, and with several MPI
  * ranks every rank must reach the same failure without deadlocking.
  *
  * The path to a valid input_class_parameters.ini is passed as argv[1]. The
- * white-noise file is then deliberately set to a missing path so the test
- * exercises FastDF's white-noise failure path rather than failing in CLASS.
+ * white-noise file is then deliberately set to a missing path so the default
+ * mode exercises FastDF's white-noise failure path. Passing "missing-class"
+ * as argv[2] instead checks that a node-leader CLASS input error reaches every
+ * rank without deadlocking.
  */
 #include <stdio.h>
 #include <string.h>
@@ -20,12 +41,14 @@ int main(int argc, char **argv) {
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-    if (argc != 2) {
+    if (argc < 2 || argc > 3 ||
+        (argc == 3 && strcmp(argv[2], "missing-class") != 0)) {
         if (rank == 0)
-            fprintf(stderr, "usage: test_fastdf_failure /path/to/input_class_parameters.ini\n");
+            fprintf(stderr, "usage: test_fastdf_failure /path/to/input_class_parameters.ini [missing-class]\n");
         MPI_Finalize();
         return 2;
     }
+    const int missing_class = argc == 3;
 
     struct params pars;
     struct units us;
@@ -66,12 +89,15 @@ int main(int argc, char **argv) {
     strcpy(pars.GaussianRandomFieldDataset, "white_noise");
     strcpy(pars.TransferFunctionDensity, "d_ncdm[0]");
     strcpy(pars.Gauge, "Newtonian");
-    snprintf(pars.ClassIniFile, DEFAULT_STRING_LENGTH, "%s", argv[1]);
+    snprintf(pars.ClassIniFile, DEFAULT_STRING_LENGTH, "%s",
+             missing_class ? "missing_class_parameters.ini" : argv[1]);
     strcpy(pars.VelocityType, "Gadget");
 
     long long result = run_fastdf(&pars, &us);
     if (rank == 0)
-        printf("run_fastdf returned %lld\n", result);
+        printf("%s: run_fastdf returned %lld\n",
+               missing_class ? "missing CLASS input" : "missing white noise",
+               result);
 
     int ok = (result < 0) ? 1 : 0;
     int global_ok = 0;

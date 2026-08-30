@@ -25,6 +25,8 @@
 #include <particle_generator.hh>
 #include <particle_plt.hh>
 
+#include <algorithm>
+#include <limits>
 #include <unistd.h> // for unlink
 
 #ifdef USE_FASTDF
@@ -520,8 +522,19 @@ int run( config_file& the_config )
 
 #if defined(USE_MPI)
             Grid_FFT<real_t,false> noise_small_aggr({nsmall,nsmall,nsmall}, {boxlen,boxlen,boxlen});
-            MPI_Reduce(noise_small.data_, noise_small_aggr.data_, nsmall*nsmall*nsmall,
-                       MPI::get_datatype<real_t>(), MPI_SUM, 0, MPI_COMM_WORLD);
+            /* In-place real FFT arrays contain two padding elements at the end
+             * of every row. Reduce the complete allocation, not nsmall^3
+             * contiguous elements: the latter truncates the last real-space
+             * slabs and leaves the aggregate tail uninitialized. Chunk the
+             * operation because MPI_Reduce uses an int element count. */
+            const size_t reduce_size = noise_small.memsize();
+            const size_t max_mpi_count = static_cast<size_t>(std::numeric_limits<int>::max());
+            for (size_t offset = 0; offset < reduce_size;) {
+                const int count = static_cast<int>(std::min(reduce_size - offset, max_mpi_count));
+                MPI_Reduce(noise_small.data_ + offset, noise_small_aggr.data_ + offset, count,
+                           MPI::get_datatype<real_t>(), MPI_SUM, 0, MPI_COMM_WORLD);
+                offset += static_cast<size_t>(count);
+            }
             if (CONFIG::MPI_task_rank == 0) {
                 unlink(white_noise_fname.c_str());
                 noise_small_aggr.Write_to_HDF5(white_noise_fname, white_noise_dset);
